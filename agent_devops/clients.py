@@ -4,7 +4,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-import config
+from agent_devops import config
 
 RENDER_API = "https://api.render.com/v1"
 GITHUB_API = "https://api.github.com"
