@@ -7,10 +7,9 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from unittest import mock
 
-import app
-import clients
-import config
-from taches import deploiements
+import agent_devops
+from agent_devops import clients, serveur
+from agent_devops.taches import deploiements
 
 SHA = "a" * 40
 AUTRE = "b" * 40
@@ -30,7 +29,7 @@ class TestDeploiements(unittest.TestCase):
     def verifier(self, deploys, github=SHA, commit=""):
         with mock.patch.object(clients, "deploiements_render", return_value=deploys), \
                 mock.patch.object(clients, "dernier_commit_github", return_value={"sha": github, "message": "m"}):
-            return deploiements.verifier_agent("agent_emploi", commit)
+            return deploiements.verifier_agent("emploi", commit)
 
     def test_a_jour(self):
         r = self.verifier([deploy("live")])
@@ -56,17 +55,32 @@ class TestDeploiements(unittest.TestCase):
         self.assertEqual(self.verifier([])["verdict"], "inconnu")
 
     def test_service_non_configure(self):
-        r = deploiements.verifier_agent("agent_perso")
+        r = deploiements.verifier_agent("perso")
         self.assertEqual(r["verdict"], "non_configure")
 
     def test_erreur_render_sans_secret(self):
         with mock.patch.object(clients, "deploiements_render", side_effect=clients.ErreurApi("Render : HTTP 401")):
-            r = deploiements.verifier_agent("agent_emploi")
+            r = deploiements.verifier_agent("emploi")
         self.assertEqual(r["verdict"], "erreur")
         self.assertNotIn("cle-secrete", json.dumps(r))
 
     def test_agent_inconnu(self):
-        self.assertIn("erreur", deploiements.executer({"agent": "x"}))
+        r = deploiements.executer({"agent": "x"})
+        self.assertIn("erreur", r)
+        self.assertEqual(r["agents_possibles"], ["emploi", "manager", "perso"])
+        with self.assertRaises(agent_devops.ErreurDevops):
+            agent_devops.verifier_deploiements(agent="instagram")
+
+    def test_sans_cle_render(self):
+        with mock.patch.dict(os.environ, {"RENDER_API_KEY": ""}):
+            with self.assertRaises(agent_devops.ErreurDevops) as c:
+                agent_devops.verifier_deploiements()
+            self.assertIn("RENDER_API_KEY", deploiements.executer({})["erreur"])
+        self.assertIn("RENDER_API_KEY", str(c.exception))
+
+    def test_echec_dit_ce_qui_reste_en_ligne(self):
+        r = self.verifier([deploy("build_failed"), deploy("live", AUTRE)])
+        self.assertIn("Toujours en ligne : bbbbbbb", r["resume"])
 
     def test_client_render_deballe_et_n_expose_pas_la_cle(self):
         class Rep:
@@ -91,12 +105,79 @@ class TestDeploiements(unittest.TestCase):
         self.assertNotIn("cle-secrete", str(c.exception))
 
 
+class TestBibliotheque(unittest.TestCase):
+    """L'appel en bibliothèque, tel que le fait l'agent chef : Render et GitHub simulés au niveau HTTP."""
+
+    def setUp(self):
+        self.render = {"srv-chef": [{"deploy": deploy("live")}], "srv-emploi": [{"deploy": deploy("live")}],
+                       "srv-perso": [{"deploy": deploy("live")}]}
+        self.github = {"AnthonyStocko/agent-manager": SHA, "AnthonyStocko/agent-emploi": SHA,
+                       "AnthonyStocko/agent-perso": SHA}
+        self.appels = []
+
+        def faux_get(url, jeton, timeout=20):
+            self.appels.append((url, jeton))
+            if url.startswith(clients.RENDER_API):
+                service = url.split("/services/")[1].split("/")[0]
+                if service not in self.render:
+                    raise clients.ErreurApi("HTTP 404")
+                return self.render[service]
+            depot = url.split("/repos/")[1].split("/commits/")[0]
+            return {"sha": self.github[depot], "commit": {"message": "Correctif"}}
+
+        env = {"RENDER_API_KEY": "cle-secrete", "RENDER_SERVICE_ID": "srv-chef",
+               "RENDER_SERVICE_AGENT_EMPLOI": "srv-emploi", "RENDER_SERVICE_AGENT_PERSO": "srv-perso",
+               "DEV_GITHUB_TOKEN": "ghp_dev"}
+        for p in (mock.patch.object(clients, "_get", faux_get), mock.patch.dict(os.environ, env, clear=True)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def verdicts(self, **kw):
+        return {a["agent"]: a["verdict"] for a in agent_devops.verifier_deploiements(**kw)["agents"]}
+
+    def test_tout_a_jour(self):
+        r = agent_devops.verifier_deploiements()
+        self.assertTrue(r["tout_est_a_jour"])
+        # seuls les agents hébergés sur Render sont suivis ; le service de l'agent chef vient de RENDER_SERVICE_ID
+        self.assertEqual([a["agent"] for a in r["agents"]], ["manager", "emploi", "perso"])
+        self.assertIn("tout est à jour", agent_devops.texte(r))
+        # Render est lu avec sa clé, GitHub avec le jeton de l'agent développeur à défaut de GITHUB_TOKEN
+        self.assertEqual({j for u, j in self.appels if u.startswith(clients.RENDER_API)}, {"cle-secrete"})
+        self.assertEqual({j for u, j in self.appels if u.startswith(clients.GITHUB_API)}, {"ghp_dev"})
+
+    def test_commit_pas_encore_en_ligne(self):
+        self.github["AnthonyStocko/agent-emploi"] = AUTRE
+        r = agent_devops.verifier_deploiements()
+        self.assertFalse(r["tout_est_a_jour"])
+        self.assertEqual(self.verdicts(), {"manager": "a_jour", "emploi": "commit_different", "perso": "a_jour"})
+        self.assertIn("aaaaaaa", agent_devops.texte(r))
+        self.assertIn("bbbbbbb", agent_devops.texte(r))
+
+    def test_commit_precis_sans_appel_a_github(self):
+        self.assertEqual(self.verdicts(agent="perso", commit="aaaaaaa"), {"perso": "a_jour"})
+        self.assertEqual(self.verdicts(agent="perso", commit="bbbbbbb"), {"perso": "commit_different"})
+        self.assertFalse(any(u.startswith(clients.GITHUB_API) for u, _ in self.appels))
+
+    def test_service_non_configure_ou_en_erreur(self):
+        self.render.pop("srv-perso")
+        with mock.patch.dict(os.environ, {"RENDER_SERVICE_AGENT_EMPLOI": ""}):
+            r = agent_devops.verifier_deploiements()
+        self.assertEqual({a["agent"]: a["verdict"] for a in r["agents"]},
+                         {"manager": "a_jour", "emploi": "non_configure", "perso": "erreur"})
+        self.assertIn("RENDER_SERVICE_AGENT_EMPLOI", r["agents"][1]["resume"])
+        self.assertNotIn("cle-secrete", str(r))
+
+    def test_reponse_render_sans_enveloppe(self):
+        self.render["srv-emploi"] = [{"commit": {"id": SHA}, "status": "live"}]
+        self.assertEqual(self.verdicts(agent="emploi"), {"emploi": "a_jour"})
+
+
 class TestServeur(unittest.TestCase):
     def setUp(self):
-        env = mock.patch.dict(os.environ, {"HUB_TOKEN": "hub"}, clear=True)
+        env = mock.patch.dict(os.environ, {"HUB_TOKEN": "hub", "RENDER_API_KEY": "cle-secrete"}, clear=True)
         env.start()
         self.addCleanup(env.stop)
-        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), app.Gestionnaire)
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), serveur.Gestionnaire)
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
         self.addCleanup(self.srv.server_close)
         self.addCleanup(self.srv.shutdown)
@@ -128,7 +209,7 @@ class TestServeur(unittest.TestCase):
         self.assertEqual(self.appel("/agent/devops/deploiements", "hub", "POST")[0], 405)
 
     def test_deploiements(self):
-        code, corps = self.appel("/agent/devops/deploiements?agent=agent_perso", "hub")
+        code, corps = self.appel("/agent/devops/deploiements?agent=perso", "hub")
         self.assertEqual(code, 200)
         self.assertEqual(corps["agents"][0]["verdict"], "non_configure")
 
