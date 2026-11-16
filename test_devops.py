@@ -172,6 +172,132 @@ class TestBibliotheque(unittest.TestCase):
         self.assertEqual(self.verdicts(agent="emploi"), {"emploi": "a_jour"})
 
 
+class TestVariables(unittest.TestCase):
+    """Réglage d'une variable Render : seule écriture de l'agent, en deux temps (préparer, puis définir)."""
+
+    def setUp(self):
+        self.ecritures, self.lectures = [], []
+        self.deploys = []            # ce que Render répond à la lecture des déploiements, après l'écriture
+        self.echec = {}              # méthode -> ErreurApi à lever
+
+        def faux_ecrire(methode, url, jeton, corps, timeout=30):
+            self.ecritures.append((methode, url, jeton, corps))
+            if methode in self.echec:
+                raise self.echec[methode]
+            return {}
+
+        def faux_get(url, jeton, timeout=20):
+            self.lectures.append(url)
+            return self.deploys
+
+        env = {"RENDER_API_KEY": "cle-secrete", "RENDER_SERVICE_AGENT_PERSO": "srv-perso"}
+        for p in (mock.patch.object(clients, "_ecrire", faux_ecrire), mock.patch.object(clients, "_get", faux_get),
+                  mock.patch.dict(os.environ, env, clear=True)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def definir(self, nom="JOB_ALERT_SENDERS", valeur="linkedin.com, indeed.com", agent="perso"):
+        return agent_devops.definir_variable(agent, nom, valeur, attente=0)
+
+    def test_preparer_ne_touche_a_rien(self):
+        d = agent_devops.preparer_variable("perso", " JOB_ALERT_SENDERS ", " linkedin.com, indeed.com ")
+        self.assertEqual((d["agent"], d["nom"], d["valeur"]), ("perso", "JOB_ALERT_SENDERS", "linkedin.com, indeed.com"))
+        for mot in ("Agent perso", "JOB_ALERT_SENDERS", "linkedin.com, indeed.com", "redéployé"):
+            self.assertIn(mot, d["resume"])
+        self.assertEqual((self.ecritures, self.lectures), ([], []))
+
+    def test_definir_enregistre_puis_lance_le_deploiement(self):
+        r = self.definir()
+        self.assertEqual([(m, u) for m, u, _, _ in self.ecritures], [
+            ("PUT", "https://api.render.com/v1/services/srv-perso/env-vars/JOB_ALERT_SENDERS"),
+            ("POST", "https://api.render.com/v1/services/srv-perso/deploys")])
+        self.assertEqual(self.ecritures[0][3], {"value": "linkedin.com, indeed.com"})
+        self.assertEqual({j for _, _, j, _ in self.ecritures}, {"cle-secrete"})
+        self.assertEqual(r["deploiement"], "lance")
+        self.assertIn("✅", r["resume"])
+        self.assertNotIn("cle-secrete", str(r))
+        # aucune lecture des variables existantes : seule la liste des déploiements est consultée
+        self.assertTrue(all("/deploys" in u and "env-vars" not in u for u in self.lectures))
+
+    def test_pas_de_second_deploiement_si_render_en_a_lance_un(self):
+        self.deploys = [{"deploy": deploy("build_in_progress")}]
+        r = self.definir()
+        self.assertEqual([m for m, *_ in self.ecritures], ["PUT"])
+        self.assertEqual(r["deploiement"], "en_cours")
+
+    def test_variable_non_enregistree(self):
+        self.echec["PUT"] = clients.ErreurApi("HTTP 401")
+        with self.assertRaises(agent_devops.ErreurDevops) as c:
+            self.definir()
+        self.assertIn("Rien n'a changé", str(c.exception))
+        self.assertEqual([m for m, *_ in self.ecritures], ["PUT"])
+        self.assertNotIn("cle-secrete", str(c.exception))
+
+    def test_deploiement_non_lance_est_signale(self):
+        self.echec["POST"] = clients.ErreurApi("HTTP 500")
+        r = self.definir()
+        self.assertEqual(r["deploiement"], "a_lancer")
+        self.assertIn("⚠️", r["resume"])
+        self.assertIn("enregistrée", r["resume"])
+
+    def test_refus(self):
+        cas = [
+            ("perso", "APP_PASSWORD", "x", "secret"),
+            ("perso", "CLAUDE_CODE_OAUTH_TOKEN", "x", "secret"),
+            ("perso", "RENDER_API_KEY", "x", "secret"),
+            ("perso", "DATABASE_URL", "x", "secret"),
+            ("perso", "RENDER_SERVICE_AGENT_PERSO", "srv-x", "réservée"),
+            ("perso", "PORT", "80", "réservée"),
+            ("perso", "job_alert", "x", "invalide"),
+            ("perso", "A B", "x", "invalide"),
+            ("perso", "JOB_ALERT_SENDERS", "", "valeur"),
+            ("perso", "JOB_ALERT_SENDERS", "a\nb", "Valeur refusée"),
+            ("perso", "JOB_ALERT_SENDERS", "x" * 2001, "Valeur refusée"),
+            ("instagram", "JOB_ALERT_SENDERS", "x", "Agent inconnu"),
+            ("emploi", "JOB_ALERT_SENDERS", "x", "RENDER_SERVICE_AGENT_EMPLOI"),   # service non configuré
+        ]
+        for agent, nom, valeur, attendu in cas:
+            for fonction in (agent_devops.preparer_variable, lambda *a: agent_devops.definir_variable(*a, attente=0)):
+                with self.subTest(nom=nom, valeur=valeur[:10], agent=agent), \
+                        self.assertRaises(agent_devops.ErreurDevops) as c:
+                    fonction(agent, nom, valeur)
+                self.assertIn(attendu, str(c.exception))
+        self.assertEqual(self.ecritures, [])   # aucun refus n'a écrit quoi que ce soit
+
+    def test_sans_cle_render(self):
+        with mock.patch.dict(os.environ, {"RENDER_API_KEY": ""}), self.assertRaises(agent_devops.ErreurDevops) as c:
+            agent_devops.preparer_variable("perso", "JOB_ALERT_SENDERS", "x")
+        self.assertIn("RENDER_API_KEY", str(c.exception))
+
+    def test_le_serveur_http_ne_sert_pas_cette_ecriture(self):
+        from agent_devops.taches import TACHES
+        self.assertEqual(sorted(TACHES), ["deploiements"])
+
+    def test_client_ecriture_sans_secret_dans_l_erreur(self):
+        self.addCleanup(mock.patch.stopall)
+        mock.patch.stopall()
+        with mock.patch.dict(os.environ, {"RENDER_API_KEY": "cle-secrete"}, clear=True):
+            vu = {}
+
+            class Rep:
+                def __enter__(s): return s
+                def __exit__(s, *a): pass
+                def read(s): return b"{}"
+
+            def faux(req, timeout=0):
+                vu.update(url=req.full_url, methode=req.get_method(), corps=json.loads(req.data),
+                          auth=req.get_header("Authorization"))
+                return Rep()
+            with mock.patch("urllib.request.urlopen", faux):
+                clients.definir_variable_render("srv-1", "MA_VAR", "é à")
+            self.assertEqual((vu["methode"], vu["corps"], vu["auth"]), ("PUT", {"value": "é à"}, "Bearer cle-secrete"))
+            self.assertTrue(vu["url"].endswith("/services/srv-1/env-vars/MA_VAR"))
+            err = urllib.error.HTTPError("https://x/?k=cle-secrete", 403, "no", {}, None)
+            with mock.patch("urllib.request.urlopen", side_effect=err), self.assertRaises(clients.ErreurApi) as c:
+                clients.lancer_deploiement_render("srv-1")
+            self.assertNotIn("cle-secrete", str(c.exception))
+
+
 class TestServeur(unittest.TestCase):
     def setUp(self):
         env = mock.patch.dict(os.environ, {"HUB_TOKEN": "hub", "RENDER_API_KEY": "cle-secrete"}, clear=True)

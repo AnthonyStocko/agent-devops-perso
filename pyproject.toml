@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-devops"
-version = "0.2.0"
-description = "Agent devops : vérification en lecture seule des déploiements Render des autres agents"
+version = "0.3.0"
+description = "Agent devops : déploiements Render des autres agents (vérification) et réglage de leurs variables"
 requires-python = ">=3.9"
 dependencies = []
 
