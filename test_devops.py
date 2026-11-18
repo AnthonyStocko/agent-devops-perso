@@ -8,7 +8,7 @@ from http.server import ThreadingHTTPServer
 from unittest import mock
 
 import agent_devops
-from agent_devops import clients, serveur
+from agent_devops import clients, config, serveur
 from agent_devops.taches import deploiements
 
 SHA = "a" * 40
@@ -296,6 +296,124 @@ class TestVariables(unittest.TestCase):
             with mock.patch("urllib.request.urlopen", side_effect=err), self.assertRaises(clients.ErreurApi) as c:
                 clients.lancer_deploiement_render("srv-1")
             self.assertNotIn("cle-secrete", str(c.exception))
+
+
+class TestWorkflows(unittest.TestCase):
+    """Lancement d'un workflow de la liste blanche : seconde écriture de l'agent, en deux temps."""
+
+    def setUp(self):
+        self.ecritures = []
+        self.echec = None
+
+        def faux_ecrire(methode, url, jeton, corps, timeout=30):
+            self.ecritures.append((methode, url, jeton, corps))
+            if self.echec:
+                raise self.echec
+            return None   # GitHub répond 204 sans corps
+
+        env = {"DEVOPS_ACTIONS_TOKEN": "ghp_actions", "GITHUB_TOKEN": "ghp_lecture", "DEV_GITHUB_TOKEN": "ghp_dev",
+               "RENDER_API_KEY": "cle-secrete"}
+        for p in (mock.patch.object(clients, "_ecrire", faux_ecrire), mock.patch.dict(os.environ, env, clear=True)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_liste_blanche_identique_a_claude_md(self):
+        # CLAUDE.md fait foi et l'agent développeur ne peut pas le modifier : le code n'a pas le droit de s'élargir seul
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "CLAUDE.md"), encoding="utf-8") as f:
+            lignes = [l.strip() for l in f if l.strip().startswith("| `")]
+        regles = set()
+        for ligne in lignes:
+            depot, workflow, entree, valeurs = [c.strip() for c in ligne.strip("|").split("|")]
+            regles |= {(depot.strip("`"), workflow.strip("`"), entree.strip("`"), v.strip().strip("`"))
+                       for v in valeurs.split(",")}
+        code = {(w["depot"], w["workflow"], nom, v) for w in config.WORKFLOWS.values()
+                for nom, valeurs in w["entrees"].items() for v in valeurs}
+        self.assertTrue(regles)
+        self.assertEqual(code, regles)
+        self.assertEqual(config.BRANCHE_WORKFLOWS, "main")
+
+    def test_preparer_ne_lance_rien(self):
+        d = agent_devops.preparer_workflow(" instagram-supabase ", {"etape": " deployer "})
+        self.assertEqual((d["cle"], d["entrees"]), ("instagram-supabase", {"etape": "deployer"}))
+        for mot in ("deploy-supabase.yml", "AnthonyStocko/mon-guide-agent-instagram", "branche main", "APPLIQUE les migrations",
+                    "Edge Functions", "jamais celui de Mon guide", "Un seul run"):
+            self.assertIn(mot, d["resume"])
+        self.assertIn("sans rien appliquer", agent_devops.preparer_workflow("instagram-supabase", {"etape": "apercu"})["resume"])
+        self.assertEqual(self.ecritures, [])
+
+    def test_declencher_un_seul_run_avec_le_jeton_dedie(self):
+        r = agent_devops.declencher_workflow("instagram-supabase", {"etape": "deployer"})
+        self.assertEqual(self.ecritures, [(
+            "POST", "https://api.github.com/repos/AnthonyStocko/mon-guide-agent-instagram/actions/workflows/"
+                    "deploy-supabase.yml/dispatches", "ghp_actions", {"ref": "main", "inputs": {"etape": "deployer"}})])
+        self.assertIn("✅", r["resume"])
+        self.assertIn("actions/workflows/deploy-supabase.yml", r["lien"])
+        self.assertNotIn("ghp_", str(r))
+
+    def test_pas_de_repli_sur_les_jetons_de_lecture(self):
+        with mock.patch.dict(os.environ, {"DEVOPS_ACTIONS_TOKEN": ""}):
+            for fonction in (agent_devops.preparer_workflow, agent_devops.declencher_workflow):
+                with self.assertRaises(agent_devops.ErreurDevops) as c:
+                    fonction("instagram-supabase", {"etape": "apercu"})
+                self.assertIn("DEVOPS_ACTIONS_TOKEN", str(c.exception))
+            with self.assertRaises(clients.ErreurApi):
+                clients.lancer_workflow_github("AnthonyStocko/mon-guide-agent-instagram", "deploy-supabase.yml",
+                                               "main", {"etape": "apercu"})
+        self.assertEqual(self.ecritures, [])
+
+    def test_refus(self):
+        cas = [
+            ("ig-veille", {"etape": "apercu"}, "non autorisé"),
+            ("", {"etape": "apercu"}, "non autorisé"),
+            ("instagram-supabase", {}, "doit valoir"),
+            ("instagram-supabase", None, "doit valoir"),
+            ("instagram-supabase", {"etape": "detruire"}, "doit valoir"),
+            ("instagram-supabase", {"etape": "deployer", "ref": "dev"}, "non autorisée"),
+            ("instagram-supabase", "deployer", "dictionnaire"),
+        ]
+        for cle, entrees, attendu in cas:
+            for fonction in (agent_devops.preparer_workflow, agent_devops.declencher_workflow):
+                with self.subTest(cle=cle, entrees=entrees), self.assertRaises(agent_devops.ErreurDevops) as c:
+                    fonction(cle, entrees)
+                self.assertIn(attendu, str(c.exception))
+        self.assertEqual(self.ecritures, [])
+
+    def test_erreurs_github_sans_relance(self):
+        for code, attendu in (("HTTP 401", "refuse le jeton"), ("HTTP 403", "refuse le jeton"),
+                              ("HTTP 404", "introuvable"), ("HTTP 422", "refuse les entrées"),
+                              ("service injoignable ou réponse illisible", "peut-être été lancé")):
+            self.ecritures.clear()
+            self.echec = clients.ErreurApi(code)
+            with self.subTest(code=code), self.assertRaises(agent_devops.ErreurDevops) as c:
+                agent_devops.declencher_workflow("instagram-supabase", {"etape": "apercu"})
+            self.assertIn(attendu, str(c.exception))
+            self.assertNotIn("ghp_", str(c.exception))
+            self.assertEqual(len(self.ecritures), 1)   # jamais de seconde tentative
+
+    def test_client_github_sans_secret_dans_l_erreur(self):
+        mock.patch.stopall()
+        with mock.patch.dict(os.environ, {"DEVOPS_ACTIONS_TOKEN": "ghp_actions"}, clear=True):
+            vu = {}
+
+            class Rep:
+                def __enter__(s): return s
+                def __exit__(s, *a): pass
+                def read(s): return b""
+
+            def faux(req, timeout=0):
+                vu.update(url=req.full_url, methode=req.get_method(), corps=json.loads(req.data),
+                          auth=req.get_header("Authorization"))
+                return Rep()
+            with mock.patch("urllib.request.urlopen", faux):
+                clients.lancer_workflow_github("AnthonyStocko/mon-guide-agent-instagram", "deploy-supabase.yml",
+                                               "main", {"etape": "apercu"})
+            self.assertEqual((vu["methode"], vu["auth"]), ("POST", "Bearer ghp_actions"))
+            self.assertEqual(vu["corps"], {"ref": "main", "inputs": {"etape": "apercu"}})
+            err = urllib.error.HTTPError("https://x/?t=ghp_actions", 403, "no", {}, None)
+            with mock.patch("urllib.request.urlopen", side_effect=err), self.assertRaises(clients.ErreurApi) as c:
+                clients.lancer_workflow_github("AnthonyStocko/mon-guide-agent-instagram", "deploy-supabase.yml",
+                                               "main", {"etape": "apercu"})
+            self.assertNotIn("ghp_actions", str(c.exception))
 
 
 class TestServeur(unittest.TestCase):
