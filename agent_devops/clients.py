@@ -1,7 +1,9 @@
 """Appels HTTP vers Render et GitHub. Aucun jeton n'est jamais écrit dans un message d'erreur.
 
-Tout est en lecture seule (GET), sauf deux écritures sur Render, réservées à la tâche `variables` :
-enregistrer une variable d'environnement et lancer le déploiement qui l'applique.
+Tout est en lecture seule (GET), sauf :
+- deux écritures sur Render, réservées à la tâche `variables` : enregistrer une variable d'environnement et
+  lancer le déploiement qui l'applique ;
+- une écriture sur GitHub, réservée à la tâche `workflows` : lancer un workflow de la liste blanche.
 """
 import json
 import urllib.error
@@ -55,7 +57,7 @@ def dernier_commit_github(depot, branche="main"):
 
 
 def _ecrire(methode, url, jeton, corps, timeout=30):
-    """Écriture sur Render (PUT ou POST, corps JSON). Seules les deux fonctions ci-dessous l'appellent."""
+    """Écriture (PUT ou POST, corps JSON). Seules les trois fonctions ci-dessous l'appellent."""
     entetes = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": "agent-devops/1.0",
                "Authorization": "Bearer " + jeton}
     requete = urllib.request.Request(url, data=json.dumps(corps).encode("utf-8"), headers=entetes, method=methode)
@@ -90,3 +92,17 @@ def lancer_deploiement_render(service):
         _ecrire("POST", url, config.cle_render(), {"clearCache": "do_not_clear"})
     except ErreurApi as e:
         raise ErreurApi(f"Render : {e}") from None
+
+
+def lancer_workflow_github(depot, workflow, branche, entrees):
+    """Lance un workflow GitHub Actions (POST /repos/{depot}/actions/workflows/{workflow}/dispatches), avec
+    DEVOPS_ACTIONS_TOKEN uniquement. GitHub répond 204 sans corps ; il ne donne pas le numéro du run."""
+    jeton = config.jeton_actions()
+    if not jeton:
+        raise ErreurApi("DEVOPS_ACTIONS_TOKEN absent")
+    url = (f"{GITHUB_API}/repos/{depot}/actions/workflows/"
+           f"{urllib.parse.quote(workflow, safe='')}/dispatches")
+    try:
+        _ecrire("POST", url, jeton, {"ref": branche, "inputs": dict(entrees)})
+    except ErreurApi as e:
+        raise ErreurApi(f"GitHub : {e}") from None

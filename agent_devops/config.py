@@ -16,6 +16,26 @@ AGENTS = {
 }
 
 
+# Workflows GitHub que l'agent peut lancer (workflow_dispatch, branche main). Copie de la liste blanche de
+# CLAUDE.md, qui fait foi : un test vérifie qu'elles sont identiques. Clé -> dépôt, fichier du workflow et,
+# pour chaque entrée, les valeurs autorisées avec ce que chacune fait (affiché dans la demande de confirmation).
+WORKFLOWS = {
+    "instagram-supabase": {
+        "nom": "Déploiement Supabase de l'agent Instagram",
+        "depot": "AnthonyStocko/mon-guide-agent-instagram",
+        "workflow": "deploy-supabase.yml",
+        "entrees": {
+            "etape": {
+                "apercu": "liste les migrations en attente, sans rien appliquer ni déployer",
+                "deployer": ("APPLIQUE les migrations en attente à la base, puis déploie toutes les Edge Functions, "
+                             "sur le projet Supabase de l'agent Instagram (jamais celui de Mon guide)"),
+            },
+        },
+    },
+}
+BRANCHE_WORKFLOWS = "main"
+
+
 def cle_render():
     return (os.getenv("RENDER_API_KEY") or "").strip()
 
@@ -24,6 +44,12 @@ def jeton_github():
     """Facultatif : nécessaire seulement si un dépôt est privé (ou pour éviter la limite de l'API publique).
     À défaut de GITHUB_TOKEN, le jeton de l'agent développeur (DEV_GITHUB_TOKEN) est utilisé."""
     return (os.getenv("GITHUB_TOKEN") or os.getenv("DEV_GITHUB_TOKEN") or "").strip()
+
+
+def jeton_actions():
+    """Seul jeton utilisé pour lancer un workflow : DEVOPS_ACTIONS_TOKEN, limité au dépôt de l'agent Instagram
+    avec la permission Actions en écriture. Jamais de repli sur GITHUB_TOKEN ni DEV_GITHUB_TOKEN."""
+    return (os.getenv("DEVOPS_ACTIONS_TOKEN") or "").strip()
 
 
 def jeton_acces():

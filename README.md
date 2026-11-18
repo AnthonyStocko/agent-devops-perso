@@ -45,8 +45,6 @@ la demande sans rien modifier, `definir_variable` l'exécute. Sont refusés :
 
 ### Déclencher un workflow en liste blanche (seconde écriture)
 
-> Autorisé le 18 novembre 2026, pas encore développé.
-
 Il lance un workflow GitHub Actions (`workflow_dispatch`, branche `main`), mais seulement ceux de la
 liste blanche, avec les valeurs d'entrée prévues :
 
@@ -59,12 +57,15 @@ déploie toutes les Edge Functions sur le projet Supabase de l'agent Instagram (
 guide).
 
 Comme pour les variables, cela se fait en deux temps : `preparer_workflow` vérifie la demande sans rien
-appeler, puis `declencher_workflow` lance un seul run, sans relance automatique. La confirmation dit ce
+appeler, puis `declencher_workflow` lance un seul run (`POST /repos/{dépôt}/actions/workflows/{fichier}/dispatches`),
+sans relance automatique : en cas d'erreur ou de réponse incertaine, il le dit et donne le lien du workflow
+dans GitHub Actions. La confirmation dit ce
 que fait l'étape choisie. Le déclenchement utilise un jeton dédié, `DEVOPS_ACTIONS_TOKEN` ; sans lui,
 il est refusé.
 
-La liste blanche fait foi dans [CLAUDE.md](CLAUDE.md) : le code en garde une copie identique, et
-l'élargir est une décision de cadrage, pas une modification de code.
+La liste blanche fait foi dans [CLAUDE.md](CLAUDE.md) : le code en garde une copie identique
+(`config.WORKFLOWS`), et un test échoue dès qu'elles diffèrent. L'élargir est une décision de cadrage, pas
+une modification de code.
 
 ## Ce qu'il ne fait jamais
 
@@ -86,8 +87,8 @@ Les règles qui s'imposent à toute modification du code sont dans [CLAUDE.md](C
 
 **L'agent chef** ([agent-manager](https://github.com/AnthonyStocko/agent-manager)), et lui seul : dans
 sa discussion (« est-ce que le correctif de l'agent emploi est en ligne ? », « ajoute la variable
-JOB_ALERT_SENDERS à l'agent perso avec linkedin.com », et bientôt « déploie les fonctions Supabase de
-l'agent Instagram ») et par le bouton **Vérifier les déploiements** de son onglet Développeur.
+JOB_ALERT_SENDERS à l'agent perso avec linkedin.com », « déploie les fonctions Supabase de l'agent
+Instagram ») et par le bouton **Vérifier les déploiements** de son onglet Développeur.
 
 ### Aujourd'hui : en bibliothèque, dans l'agent chef
 
@@ -101,12 +102,16 @@ demande = agent_devops.preparer_variable("perso", "JOB_ALERT_SENDERS", "linkedin
 print(demande["resume"])                                        # à montrer, puis attendre un « oui »
 resultat = agent_devops.definir_variable("perso", "JOB_ALERT_SENDERS", "linkedin.com")
 print(resultat["resume"])
+
+demande = agent_devops.preparer_workflow("instagram-supabase", {"etape": "deployer"})   # ne lance rien
+print(demande["resume"])                                        # à montrer, puis attendre un « oui »
+resultat = agent_devops.declencher_workflow("instagram-supabase", {"etape": "deployer"})
+print(resultat["resume"])
 ```
 
-`ErreurDevops` est levée quand une demande est refusée ou impossible (clé Render absente, agent inconnu,
-nom ou valeur refusés, variable non enregistrée). Ces cinq noms sont l'interface utilisée par l'agent
-chef : ne pas les renommer sans le modifier aussi. Le déclenchement des workflows y ajoutera
-`preparer_workflow` et `declencher_workflow`, sur le même modèle.
+`ErreurDevops` est levée quand une demande est refusée ou impossible (clé Render ou jeton absents, agent ou
+workflow inconnus, nom, valeur ou entrée refusés, écriture refusée par Render ou GitHub). Ces sept noms
+sont l'interface utilisée par l'agent chef : ne pas les renommer sans le modifier aussi.
 
 L'agent chef fixe la version qu'il installe par un commit, dans son `requirements.txt` :
 
@@ -164,5 +169,6 @@ variable Render et le déclenchement d'un workflow de la liste blanche.
 - `agent_devops/config.py` : agents suivis et variables — `agent_devops/clients.py` : appels Render et GitHub
 - `agent_devops/taches/deploiements.py` : vérification des déploiements
 - `agent_devops/taches/variables.py` : réglage d'une variable d'environnement
+- `agent_devops/taches/workflows.py` : lancement d'un workflow de la liste blanche
 - `agent_devops/serveur.py` : serveur HTTP autonome — `app.py` : son lancement
 - `pyproject.toml` : rend le dépôt installable — `test_devops.py` : tests
