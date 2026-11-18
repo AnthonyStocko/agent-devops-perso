@@ -2,8 +2,9 @@
 
 ## Mission
 
-S'occuper de la mise en ligne des agents hébergés sur Render : dire si ce qui est en ligne correspond
-au code, et régler leurs variables d'environnement.
+S'occuper de la mise en ligne des agents : dire si ce qui est en ligne sur Render correspond au code,
+régler les variables d'environnement des agents sur Render, et lancer les workflows de déploiement
+autorisés sur GitHub.
 
 C'est un agent à part entière, avec son dépôt et ses tests. **Pour l'instant il tourne dans le
 processus de l'agent chef**, qui installe ce dépôt comme dépendance (la limite de services Render est
@@ -27,7 +28,7 @@ de `main` sur GitHub (ou prend un commit précis) et rend un verdict :
 Agents suivis (`agent_devops/config.py`) : `manager` (agent chef), `emploi`, `perso`. L'agent
 développeur (GitHub Actions) et l'agent Instagram (Supabase) ne sont pas sur Render : ils ne sont pas suivis.
 
-### Régler une variable d'environnement (sa seule écriture)
+### Régler une variable d'environnement (première écriture)
 
 Il crée une variable d'un agent suivi, ou remplace sa valeur
 (`PUT /v1/services/{id}/env-vars/{nom}`), puis s'assure qu'un déploiement l'applique : celui que Render
@@ -42,13 +43,38 @@ la demande sans rien modifier, `definir_variable` l'exécute. Sont refusés :
 - une variable réservée (`PORT`, `RENDER_...`) ;
 - une valeur vide, sur plusieurs lignes ou de plus de 2 000 caractères.
 
+### Déclencher un workflow en liste blanche (seconde écriture)
+
+> Autorisé le 18 novembre 2026, pas encore développé.
+
+Il lance un workflow GitHub Actions (`workflow_dispatch`, branche `main`), mais seulement ceux de la
+liste blanche, avec les valeurs d'entrée prévues :
+
+| Dépôt | Workflow | Entrée | Valeurs autorisées |
+|---|---|---|---|
+| `AnthonyStocko/mon-guide-agent-instagram` | `deploy-supabase.yml` | `etape` | `apercu`, `deployer` |
+
+`apercu` montre les migrations en attente sans rien appliquer. `deployer` applique ces migrations, puis
+déploie toutes les Edge Functions sur le projet Supabase de l'agent Instagram (jamais celui de Mon
+guide).
+
+Comme pour les variables, cela se fait en deux temps : `preparer_workflow` vérifie la demande sans rien
+appeler, puis `declencher_workflow` lance un seul run, sans relance automatique. La confirmation dit ce
+que fait l'étape choisie. Le déclenchement utilise un jeton dédié, `DEVOPS_ACTIONS_TOKEN` ; sans lui,
+il est refusé.
+
+La liste blanche fait foi dans [CLAUDE.md](CLAUDE.md) : le code en garde une copie identique, et
+l'élargir est une décision de cadrage, pas une modification de code.
+
 ## Ce qu'il ne fait jamais
 
-- **Écrire autre chose qu'une variable de réglage.** Aucune suppression de variable, aucun redémarrage ni
-  suppression de service, aucun changement de configuration, aucun commit. Il ne lance un déploiement que
-  pour appliquer la variable qu'il vient d'enregistrer. Sur GitHub, il est en lecture seule.
-- **Écrire sans confirmation.** Le réglage d'une variable n'est pas servi par le serveur HTTP, qui refuse
-  tout sauf GET : il passe par l'agent chef, qui montre l'agent, le nom et la valeur, et attend un « oui ».
+- **Écrire autre chose que ses deux écritures.** Sur Render : aucune suppression de variable, aucun
+  redémarrage ni suppression de service, aucun changement de configuration ; il ne lance un déploiement
+  que pour appliquer la variable qu'il vient d'enregistrer. Sur GitHub : aucun commit, aucune pull
+  request, aucun workflow hors de la liste blanche, aucune annulation ni relance de run, aucune
+  modification de workflow, de secret ou de variable.
+- **Écrire sans confirmation.** Ses deux écritures ne sont pas servies par le serveur HTTP, qui refuse
+  tout sauf GET : elles passent par l'agent chef, qui montre ce qui sera fait et attend un « oui ».
 - **Lire ou montrer un secret.** Les valeurs des variables en place ne sont jamais lues. Ni la clé Render
   ni un jeton n'apparaît dans une réponse, une erreur ou un journal.
 - **Sortir de son domaine.** Il ne modifie pas le code (rôle d'agent-dev) et ne parle pas à l'utilisateur
@@ -60,8 +86,8 @@ Les règles qui s'imposent à toute modification du code sont dans [CLAUDE.md](C
 
 **L'agent chef** ([agent-manager](https://github.com/AnthonyStocko/agent-manager)), et lui seul : dans
 sa discussion (« est-ce que le correctif de l'agent emploi est en ligne ? », « ajoute la variable
-JOB_ALERT_SENDERS à l'agent perso avec linkedin.com ») et par le bouton **Vérifier les déploiements** de
-son onglet Développeur.
+JOB_ALERT_SENDERS à l'agent perso avec linkedin.com », et bientôt « déploie les fonctions Supabase de
+l'agent Instagram ») et par le bouton **Vérifier les déploiements** de son onglet Développeur.
 
 ### Aujourd'hui : en bibliothèque, dans l'agent chef
 
@@ -79,7 +105,8 @@ print(resultat["resume"])
 
 `ErreurDevops` est levée quand une demande est refusée ou impossible (clé Render absente, agent inconnu,
 nom ou valeur refusés, variable non enregistrée). Ces cinq noms sont l'interface utilisée par l'agent
-chef : ne pas les renommer sans le modifier aussi.
+chef : ne pas les renommer sans le modifier aussi. Le déclenchement des workflows y ajoutera
+`preparer_workflow` et `declencher_workflow`, sur le même modèle.
 
 L'agent chef fixe la version qu'il installe par un commit, dans son `requirements.txt` :
 
@@ -101,7 +128,7 @@ GET /agent/devops/deploiements?commit=<sha>    vérifie ce commit (SHA complet o
 
 L'appel exige l'en-tête `Authorization: Bearer <HUB_TOKEN>`. La réponse est la même que celle de
 `verifier_deploiements` ; une demande impossible renvoie `{"erreur": "..."}`. Le serveur est en lecture
-seule : le réglage des variables n'y est pas servi.
+seule : ni le réglage des variables ni le déclenchement des workflows n'y sont servis.
 
 ## Variables d'environnement
 
@@ -112,7 +139,8 @@ Elles sont lues dans le processus où l'agent tourne : aujourd'hui, le service R
 | `RENDER_API_KEY` | clé API Render (Account Settings > API Keys) ; elle donne accès à tout le compte, en lecture et en écriture |
 | `RENDER_SERVICE_AGENT_EMPLOI`, `RENDER_SERVICE_AGENT_PERSO` | identifiants `srv-...` des services Render ; un agent sans variable est signalé `non_configure` |
 | `RENDER_SERVICE_AGENT_MANAGER` | identifiant du service de l'agent chef ; inutile tant que l'agent tourne dans l'agent chef (Render fournit `RENDER_SERVICE_ID`) |
-| `GITHUB_TOKEN` | facultatif : dépôt privé ou limite de l'API GitHub ; à défaut, `DEV_GITHUB_TOKEN` est utilisé |
+| `GITHUB_TOKEN` | facultatif, lecture seule : dépôt privé ou limite de l'API GitHub ; à défaut, `DEV_GITHUB_TOKEN` est utilisé |
+| `DEVOPS_ACTIONS_TOKEN` | déclenchement des workflows uniquement : jeton GitHub à granularité fine, limité au dépôt `mon-guide-agent-instagram`, avec la seule permission « Actions » en lecture et écriture ; jamais remplacé par `GITHUB_TOKEN` ni `DEV_GITHUB_TOKEN` |
 | `HUB_TOKEN` | serveur autonome seulement : jeton que l'appelant présente ; sans lui, tout appel est refusé |
 
 ## Ajouter une tâche devops
@@ -123,7 +151,8 @@ l'enregistrer dans `agent_devops/taches/__init__.py` (`TACHES`) : elle est servi
 `agent_devops/__init__.py`.
 
 Une tâche qui écrit ne s'ajoute pas ainsi : c'est un changement de cadrage, qui se décide d'abord dans ce
-README et dans `CLAUDE.md`.
+README et dans `CLAUDE.md`. Les deux seules écritures autorisées aujourd'hui sont le réglage d'une
+variable Render et le déclenchement d'un workflow de la liste blanche.
 
 ## Tests
 
