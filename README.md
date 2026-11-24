@@ -28,6 +28,23 @@ de `main` sur GitHub (ou prend un commit précis) et rend un verdict :
 Agents suivis (`agent_devops/config.py`) : `manager` (agent chef), `emploi`, `perso`. L'agent
 développeur (GitHub Actions) et l'agent Instagram (Supabase) ne sont pas sur Render : ils ne sont pas suivis.
 
+### Détecter les workflows GitHub Actions en échec (lecture seule)
+
+Il consulte les exécutions de GitHub Actions (`GET /repos/{dépôt}/actions/runs?status=failure`, branche
+`main`) de chaque dépôt de son périmètre : les agents suivis (`manager`, `emploi`, `perso`) et le dépôt de
+l'agent Instagram. Pour chaque exécution en échec, il lit les jobs (et l'annotation d'erreur du job, quand le
+workflow en produit une) et rend : le **dépôt**, le **workflow**, la **cause** (job et étape en échec), un
+**résumé** de l'erreur, le lien du run et une **clé** stable `dépôt#run#tentative`. Les journaux bruts ne
+sont pas lus.
+
+Il ne corrige rien, ne relance rien et n'écrit rien : c'est l'agent chef qui décide si un correctif est
+nécessaire, puis le demande à l'agent développeur.
+
+**Pas de doublon.** L'agent devops ne garde aucun état. L'agent chef conserve les clés qu'il a déjà
+traitées et les repasse à chaque appel (`deja_signales`) : une exécution déjà remontée n'est plus renvoyée.
+Une relance du même run (nouvelle tentative) en échec compte comme un nouvel échec. Seuls les échecs des
+dernières 24 h sont cherchés (`depuis_heures`, 336 au maximum).
+
 ### Régler une variable d'environnement (première écriture)
 
 Il crée une variable d'un agent suivi, ou remplace sa valeur
@@ -107,11 +124,15 @@ demande = agent_devops.preparer_workflow("instagram-supabase", {"etape": "deploy
 print(demande["resume"])                                        # à montrer, puis attendre un « oui »
 resultat = agent_devops.declencher_workflow("instagram-supabase", {"etape": "deployer"})
 print(resultat["resume"])
+
+echecs = agent_devops.detecter_echecs_actions(deja_signales=cles_deja_traitees)   # lecture seule
+for e in echecs["echecs"]:                                      # dépôt, workflow, cause, résumé, url, cle
+    print(e["depot"], e["workflow"], e["cause"], e["resume"])
 ```
 
 `ErreurDevops` est levée quand une demande est refusée ou impossible (clé Render ou jeton absents, agent ou
 workflow inconnus, nom, valeur ou entrée refusés, écriture refusée par Render ou GitHub). Ces sept noms
-sont l'interface utilisée par l'agent chef : ne pas les renommer sans le modifier aussi.
+(plus `detecter_echecs_actions` et `texte_echecs_actions`, en lecture seule) sont l'interface utilisée par l'agent chef : ne pas les renommer sans le modifier aussi.
 
 L'agent chef fixe la version qu'il installe par un commit, dans son `requirements.txt` :
 
@@ -129,6 +150,8 @@ GET /healthz                                   public, sert au contrôle de dém
 GET /agent/devops/deploiements                 tous les agents
 GET /agent/devops/deploiements?agent=emploi    un seul (manager, emploi, perso)
 GET /agent/devops/deploiements?commit=<sha>    vérifie ce commit (SHA complet ou début)
+GET /agent/devops/echecs                       nouveaux workflows GitHub Actions en échec
+GET /agent/devops/echecs?deja_signales=<cle>,<cle>&depuis_heures=24&depot=<proprietaire/depot>
 ```
 
 L'appel exige l'en-tête `Authorization: Bearer <HUB_TOKEN>`. La réponse est la même que celle de
@@ -144,7 +167,7 @@ Elles sont lues dans le processus où l'agent tourne : aujourd'hui, le service R
 | `RENDER_API_KEY` | clé API Render (Account Settings > API Keys) ; elle donne accès à tout le compte, en lecture et en écriture |
 | `RENDER_SERVICE_AGENT_EMPLOI`, `RENDER_SERVICE_AGENT_PERSO` | identifiants `srv-...` des services Render ; un agent sans variable est signalé `non_configure` |
 | `RENDER_SERVICE_AGENT_MANAGER` | identifiant du service de l'agent chef ; inutile tant que l'agent tourne dans l'agent chef (Render fournit `RENDER_SERVICE_ID`) |
-| `GITHUB_TOKEN` | facultatif, lecture seule : dépôt privé ou limite de l'API GitHub ; à défaut, `DEV_GITHUB_TOKEN` est utilisé |
+| `GITHUB_TOKEN` | facultatif, lecture seule (déploiements et échecs GitHub Actions) : dépôt privé ou limite de l'API GitHub ; à défaut, `DEV_GITHUB_TOKEN` est utilisé |
 | `DEVOPS_ACTIONS_TOKEN` | déclenchement des workflows uniquement : jeton GitHub à granularité fine, limité au dépôt `mon-guide-agent-instagram`, avec la seule permission « Actions » en lecture et écriture ; jamais remplacé par `GITHUB_TOKEN` ni `DEV_GITHUB_TOKEN` |
 | `HUB_TOKEN` | serveur autonome seulement : jeton que l'appelant présente ; sans lui, tout appel est refusé |
 
@@ -168,6 +191,7 @@ variable Render et le déclenchement d'un workflow de la liste blanche.
 - `agent_devops/__init__.py` : interface appelée par l'agent chef
 - `agent_devops/config.py` : agents suivis et variables — `agent_devops/clients.py` : appels Render et GitHub
 - `agent_devops/taches/deploiements.py` : vérification des déploiements
+- `agent_devops/taches/echecs.py` : détection des workflows GitHub Actions en échec
 - `agent_devops/taches/variables.py` : réglage d'une variable d'environnement
 - `agent_devops/taches/workflows.py` : lancement d'un workflow de la liste blanche
 - `agent_devops/serveur.py` : serveur HTTP autonome — `app.py` : son lancement
