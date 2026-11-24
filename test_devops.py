@@ -271,7 +271,7 @@ class TestVariables(unittest.TestCase):
 
     def test_le_serveur_http_ne_sert_pas_cette_ecriture(self):
         from agent_devops.taches import TACHES
-        self.assertEqual(sorted(TACHES), ["deploiements"])
+        self.assertEqual(sorted(TACHES), ["deploiements", "echecs"])
 
     def test_client_ecriture_sans_secret_dans_l_erreur(self):
         self.addCleanup(mock.patch.stopall)
@@ -414,6 +414,94 @@ class TestWorkflows(unittest.TestCase):
                 clients.lancer_workflow_github("AnthonyStocko/mon-guide-agent-instagram", "deploy-supabase.yml",
                                                "main", {"etape": "apercu"})
             self.assertNotIn("ghp_actions", str(c.exception))
+
+
+class TestEchecsActions(unittest.TestCase):
+    """Détection des workflows en échec : GitHub simulé, lecture seule, sans doublon."""
+
+    def setUp(self):
+        env = mock.patch.dict(os.environ, {}, clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+        self.maintenant = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+        self.runs = {"AnthonyStocko/mon-guide-agent-instagram": [self.faux_run(11, "ig-veille")]}
+        self.appels = []
+
+        def faux_get(url, jeton, timeout=20):
+            self.appels.append(url)
+            depot = url.split("/repos/")[1].split("/actions/")[0].split("/check-runs/")[0]
+            if "/annotations" in url:
+                return [{"annotation_level": "failure", "message": "Module introuvable : veille.py"}]
+            if "/jobs" in url:
+                return {"jobs": [{"id": 5, "name": "veille", "conclusion": "failure",
+                                  "steps": [{"name": "Checkout", "conclusion": "success"},
+                                            {"name": "Lancer", "conclusion": "failure"}]}]}
+            if depot == "AnthonyStocko/agent-perso":
+                raise clients.ErreurApi("HTTP 404")
+            return {"workflow_runs": self.runs.get(depot, [])}
+
+        p = mock.patch.object(clients, "_get", faux_get)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def faux_run(self, id_, nom, heures=1):
+        date = (self.maintenant - __import__("datetime").timedelta(hours=heures)).isoformat()
+        return {"id": id_, "name": nom, "run_attempt": 1, "event": "schedule", "head_branch": "main",
+                "head_sha": SHA, "updated_at": date, "created_at": date,
+                "html_url": f"https://github.com/x/y/actions/runs/{id_}", "conclusion": "failure"}
+
+    def test_remonte_depot_workflow_cause_et_resume(self):
+        r = agent_devops.detecter_echecs_actions()
+        self.assertEqual(len(r["echecs"]), 1)
+        e = r["echecs"][0]
+        self.assertEqual(e["depot"], "AnthonyStocko/mon-guide-agent-instagram")
+        self.assertEqual(e["workflow"], "ig-veille")
+        self.assertIn("Lancer", e["cause"])
+        self.assertIn("Module introuvable", e["resume"])
+        self.assertIn("ig-veille", agent_devops.texte_echecs_actions(r))
+
+    def test_pas_de_doublon(self):
+        premier = agent_devops.detecter_echecs_actions()
+        cles = [e["cle"] for e in premier["echecs"]]
+        second = agent_devops.detecter_echecs_actions(deja_signales=cles)
+        self.assertEqual(second["echecs"], [])
+        self.assertEqual(second["deja_signales"], 1)
+
+    def test_run_en_double_dans_la_reponse(self):
+        self.runs["AnthonyStocko/mon-guide-agent-instagram"].append(self.faux_run(11, "ig-veille"))
+        self.assertEqual(len(agent_devops.detecter_echecs_actions()["echecs"]), 1)
+
+    def test_nouvelle_tentative_est_une_nouvelle_cle(self):
+        r = self.faux_run(11, "ig-veille")
+        r["run_attempt"] = 2
+        self.runs["AnthonyStocko/mon-guide-agent-instagram"].append(r)
+        self.assertEqual(len(agent_devops.detecter_echecs_actions()["echecs"]), 2)
+
+    def test_echec_trop_ancien_ignore(self):
+        self.runs["AnthonyStocko/mon-guide-agent-instagram"] = [self.faux_run(12, "vieux", heures=100)]
+        self.assertEqual(agent_devops.detecter_echecs_actions()["echecs"], [])
+        self.assertEqual(len(agent_devops.detecter_echecs_actions(depuis_heures=200)["echecs"]), 1)
+
+    def test_depot_illisible_signale_sans_bloquer(self):
+        r = agent_devops.detecter_echecs_actions()
+        self.assertIn("erreur", [d["etat"] for d in r["depots"]])
+        self.assertEqual(len(r["echecs"]), 1)
+
+    def test_depot_hors_perimetre_refuse(self):
+        with self.assertRaises(agent_devops.ErreurDevops):
+            agent_devops.detecter_echecs_actions(depot="Autre/depot")
+
+    def test_lecture_seule_get_uniquement(self):
+        with mock.patch.object(clients, "_ecrire", side_effect=AssertionError("écriture")):
+            agent_devops.detecter_echecs_actions()
+        self.assertTrue(self.appels)
+
+    def test_tache_http(self):
+        from agent_devops.taches import echecs
+        cle = "AnthonyStocko/mon-guide-agent-instagram#11#1"
+        self.assertEqual(echecs.executer({"deja_signales": cle})["echecs"], [])
+        self.assertEqual(len(echecs.executer({})["echecs"]), 1)
+        self.assertIn("erreur", echecs.executer({"depot": "x/y"}))
 
 
 class TestServeur(unittest.TestCase):
