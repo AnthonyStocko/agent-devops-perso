@@ -154,6 +154,11 @@ GET /agent/devops/echecs                       nouveaux workflows GitHub Actions
 GET /agent/devops/echecs?deja_signales=<cle>,<cle>&depuis_heures=24&depot=<proprietaire/depot>
 ```
 
+En conteneur (Coolify sur la VM Oracle, ou plus tard un serveur à la maison) : le `Dockerfile` construit
+une image arm64 ou amd64, sans dépendance, qui lance `python app.py` et se contrôle sur `/healthz`. Le
+workflow `Image Docker` vérifie à chaque push que l'image se construit pour les deux architectures et
+démarre. Variables à fournir au conteneur : celles du tableau ci-dessous, dont `HUB_TOKEN`.
+
 L'appel exige l'en-tête `Authorization: Bearer <HUB_TOKEN>`. La réponse est la même que celle de
 `verifier_deploiements` ; une demande impossible renvoie `{"erreur": "..."}`. Le serveur est en lecture
 seule : ni le réglage des variables ni le déclenchement des workflows n'y sont servis.
