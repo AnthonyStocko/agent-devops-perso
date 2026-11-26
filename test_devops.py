@@ -1,5 +1,7 @@
+import datetime
 import json
 import os
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -15,230 +17,160 @@ SHA = "a" * 40
 AUTRE = "b" * 40
 
 
-def deploy(statut, sha=SHA):
-    return {"id": "dep-1", "status": statut, "createdAt": "2026-01-01T10:00:00Z", "finishedAt": "2026-01-01T10:05:00Z",
-            "commit": {"id": sha, "message": "Correctif\ndétail"}}
+def service(commit=SHA, statut="reussi", etat="running", sante="healthy", tentative=None, erreur=""):
+    return {"commit_en_service": commit,
+            "derniere_tentative": {"commit": tentative or commit, "statut": statut, "date": "2026-11-26T16:00:00+01:00",
+                                   "erreur": erreur},
+            "conteneur": {"etat": etat, "sante": sante}}
 
 
-class TestDeploiements(unittest.TestCase):
-    def setUp(self):
-        env = mock.patch.dict(os.environ, {"RENDER_API_KEY": "cle-secrete", "RENDER_SERVICE_AGENT_EMPLOI": "srv-1"}, clear=True)
-        env.start()
-        self.addCleanup(env.stop)
-
-    def verifier(self, deploys, github=SHA, commit=""):
-        with mock.patch.object(clients, "deploiements_render", return_value=deploys), \
-                mock.patch.object(clients, "dernier_commit_github", return_value={"sha": github, "message": "m"}):
-            return deploiements.verifier_agent("emploi", commit)
-
-    def test_a_jour(self):
-        r = self.verifier([deploy("live")])
-        self.assertEqual(r["verdict"], "a_jour")
-        self.assertEqual(r["dernier_deploiement"]["statut_libelle"], "Live")
-        self.assertEqual(r["dernier_deploiement"]["message"], "Correctif")
-
-    def test_commit_different(self):
-        self.assertEqual(self.verifier([deploy("live", AUTRE)])["verdict"], "commit_different")
-
-    def test_echec_signale_et_commit_en_ligne_conserve(self):
-        r = self.verifier([deploy("build_failed"), deploy("live", AUTRE)])
-        self.assertEqual(r["verdict"], "echec")
-        self.assertEqual(r["en_ligne"]["commit"], AUTRE)
-
-    def test_en_cours(self):
-        self.assertEqual(self.verifier([deploy("build_in_progress")])["verdict"], "en_cours")
-
-    def test_commit_attendu_prefixe(self):
-        self.assertEqual(self.verifier([deploy("live")], github=AUTRE, commit="aaaaaaa")["verdict"], "a_jour")
-
-    def test_aucun_deploiement(self):
-        self.assertEqual(self.verifier([])["verdict"], "inconnu")
-
-    def test_service_non_configure(self):
-        r = deploiements.verifier_agent("perso")
-        self.assertEqual(r["verdict"], "non_configure")
-
-    def test_erreur_render_sans_secret(self):
-        with mock.patch.object(clients, "deploiements_render", side_effect=clients.ErreurApi("Render : HTTP 401")):
-            r = deploiements.verifier_agent("emploi")
-        self.assertEqual(r["verdict"], "erreur")
-        self.assertNotIn("cle-secrete", json.dumps(r))
-
-    def test_agent_inconnu(self):
-        r = deploiements.executer({"agent": "x"})
-        self.assertIn("erreur", r)
-        self.assertEqual(r["agents_possibles"], ["emploi", "manager", "perso"])
-        with self.assertRaises(agent_devops.ErreurDevops):
-            agent_devops.verifier_deploiements(agent="instagram")
-
-    def test_sans_cle_render(self):
-        with mock.patch.dict(os.environ, {"RENDER_API_KEY": ""}):
-            with self.assertRaises(agent_devops.ErreurDevops) as c:
-                agent_devops.verifier_deploiements()
-            self.assertIn("RENDER_API_KEY", deploiements.executer({})["erreur"])
-        self.assertIn("RENDER_API_KEY", str(c.exception))
-
-    def test_echec_dit_ce_qui_reste_en_ligne(self):
-        r = self.verifier([deploy("build_failed"), deploy("live", AUTRE)])
-        self.assertIn("Toujours en ligne : bbbbbbb", r["resume"])
-
-    def test_client_render_deballe_et_n_expose_pas_la_cle(self):
-        class Rep:
-            def __enter__(s): return s
-            def __exit__(s, *a): pass
-            def read(s): return json.dumps([{"deploy": deploy("live"), "cursor": "c"}]).encode()
-        vu = {}
-        def faux(req, timeout=0):
-            vu["url"], vu["auth"] = req.full_url, req.get_header("Authorization")
-            return Rep()
-        with mock.patch("urllib.request.urlopen", faux):
-            d = clients.deploiements_render("srv-1")
-        self.assertEqual(d[0]["status"], "live")
-        self.assertIn("/services/srv-1/deploys", vu["url"])
-        self.assertEqual(vu["auth"], "Bearer cle-secrete")
-
-    def test_client_erreur_http_sans_secret(self):
-        err = urllib.error.HTTPError("https://x/?k=cle-secrete", 401, "no", {}, None)
-        with mock.patch("urllib.request.urlopen", side_effect=err):
-            with self.assertRaises(clients.ErreurApi) as c:
-                clients.deploiements_render("srv-1")
-        self.assertNotIn("cle-secrete", str(c.exception))
-
-
-class TestBibliotheque(unittest.TestCase):
-    """L'appel en bibliothèque, tel que le fait l'agent chef : Render et GitHub simulés au niveau HTTP."""
+class AvecEtat(unittest.TestCase):
+    """Fichier d'état du serveur (écrit par mettre-a-jour.sh) dans un dossier temporaire, GitHub simulé."""
 
     def setUp(self):
-        self.render = {"srv-chef": [{"deploy": deploy("live")}], "srv-emploi": [{"deploy": deploy("live")}],
-                       "srv-perso": [{"deploy": deploy("live")}]}
-        self.github = {"AnthonyStocko/agent-manager": SHA, "AnthonyStocko/agent-emploi": SHA,
-                       "AnthonyStocko/agent-perso": SHA}
+        self.dossier = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dossier.cleanup)
+        self.chemin = os.path.join(self.dossier.name, "deploiements.json")
+        self.services = {s: service() for s in ("agent-manager", "agent-emploi", "agent-perso", "agent-devops")}
+        self.genere_le = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self.github = {a["depot"]: SHA for a in config.AGENTS.values()}
         self.appels = []
 
         def faux_get(url, jeton, timeout=20):
             self.appels.append((url, jeton))
-            if url.startswith(clients.RENDER_API):
-                service = url.split("/services/")[1].split("/")[0]
-                if service not in self.render:
-                    raise clients.ErreurApi("HTTP 404")
-                return self.render[service]
             depot = url.split("/repos/")[1].split("/commits/")[0]
-            return {"sha": self.github[depot], "commit": {"message": "Correctif"}}
+            if self.github.get(depot) is None:
+                raise clients.ErreurApi("HTTP 404")
+            return {"sha": self.github[depot], "commit": {"message": "Correctif\ndétail"}}
 
-        env = {"RENDER_API_KEY": "cle-secrete", "RENDER_SERVICE_ID": "srv-chef",
-               "RENDER_SERVICE_AGENT_EMPLOI": "srv-emploi", "RENDER_SERVICE_AGENT_PERSO": "srv-perso",
-               "DEV_GITHUB_TOKEN": "ghp_dev"}
+        env = {"DEVOPS_ETAT": self.chemin, "DEV_GITHUB_TOKEN": "ghp_dev"}
         for p in (mock.patch.object(clients, "_get", faux_get), mock.patch.dict(os.environ, env, clear=True)):
             p.start()
             self.addCleanup(p.stop)
 
+    def ecrire_etat(self):
+        with open(self.chemin, "w", encoding="utf-8") as f:
+            json.dump({"genere_le": self.genere_le, "services": self.services}, f)
+
+    def verifier(self, **kw):
+        self.ecrire_etat()
+        return agent_devops.verifier_deploiements(**kw)
+
     def verdicts(self, **kw):
-        return {a["agent"]: a["verdict"] for a in agent_devops.verifier_deploiements(**kw)["agents"]}
+        return {a["agent"]: a["verdict"] for a in self.verifier(**kw)["agents"]}
 
+
+class TestDeploiements(AvecEtat):
     def test_tout_a_jour(self):
-        r = agent_devops.verifier_deploiements()
+        r = self.verifier()
         self.assertTrue(r["tout_est_a_jour"])
-        # seuls les agents hébergés sur Render sont suivis ; le service de l'agent chef vient de RENDER_SERVICE_ID
-        self.assertEqual([a["agent"] for a in r["agents"]], ["manager", "emploi", "perso"])
+        self.assertEqual(set(self.verdicts()), {"manager", "emploi", "perso", "devops"})
         self.assertIn("tout est à jour", agent_devops.texte(r))
-        # Render est lu avec sa clé, GitHub avec le jeton de l'agent développeur à défaut de GITHUB_TOKEN
-        self.assertEqual({j for u, j in self.appels if u.startswith(clients.RENDER_API)}, {"cle-secrete"})
-        self.assertEqual({j for u, j in self.appels if u.startswith(clients.GITHUB_API)}, {"ghp_dev"})
+        self.assertFalse(r["etat_perime"])
 
-    def test_commit_pas_encore_en_ligne(self):
+    def test_commit_different(self):
         self.github["AnthonyStocko/agent-emploi"] = AUTRE
-        r = agent_devops.verifier_deploiements()
-        self.assertFalse(r["tout_est_a_jour"])
-        self.assertEqual(self.verdicts(), {"manager": "a_jour", "emploi": "commit_different", "perso": "a_jour"})
-        self.assertIn("aaaaaaa", agent_devops.texte(r))
-        self.assertIn("bbbbbbb", agent_devops.texte(r))
+        self.assertEqual(self.verdicts(agent="emploi"), {"emploi": "commit_different"})
 
-    def test_commit_precis_sans_appel_a_github(self):
-        self.assertEqual(self.verdicts(agent="perso", commit="aaaaaaa"), {"perso": "a_jour"})
-        self.assertEqual(self.verdicts(agent="perso", commit="bbbbbbb"), {"perso": "commit_different"})
-        self.assertFalse(any(u.startswith(clients.GITHUB_API) for u, _ in self.appels))
+    def test_mise_a_jour_en_cours(self):
+        self.services["agent-perso"] = service(statut="en_cours", tentative=AUTRE)
+        r = self.verifier(agent="perso")["agents"][0]
+        self.assertEqual(r["verdict"], "en_cours")
+        self.assertIn(AUTRE[:7], r["resume"])
 
-    def test_service_non_configure_ou_en_erreur(self):
-        self.render.pop("srv-perso")
-        with mock.patch.dict(os.environ, {"RENDER_SERVICE_AGENT_EMPLOI": ""}):
-            r = agent_devops.verifier_deploiements()
-        self.assertEqual({a["agent"]: a["verdict"] for a in r["agents"]},
-                         {"manager": "a_jour", "emploi": "non_configure", "perso": "erreur"})
-        self.assertIn("RENDER_SERVICE_AGENT_EMPLOI", r["agents"][1]["resume"])
-        self.assertNotIn("cle-secrete", str(r))
+    def test_echec_dit_ce_qui_reste_en_service(self):
+        self.services["agent-perso"] = service(statut="echec", tentative=AUTRE, erreur="pip install a échoué")
+        r = self.verifier(agent="perso")["agents"][0]
+        self.assertEqual(r["verdict"], "echec")
+        self.assertIn("Toujours en service : " + SHA[:7], r["resume"])
+        self.assertIn("pip install", r["resume"])
 
-    def test_reponse_render_sans_enveloppe(self):
-        self.render["srv-emploi"] = [{"commit": {"id": SHA}, "status": "live"}]
-        self.assertEqual(self.verdicts(agent="emploi"), {"emploi": "a_jour"})
+    def test_conteneur_arrete_ou_malade(self):
+        self.services["agent-emploi"] = service(etat="exited", sante="")
+        self.services["agent-perso"] = service(sante="unhealthy")
+        v = self.verdicts()
+        self.assertEqual((v["emploi"], v["perso"]), ("hors_service", "hors_service"))
+
+    def test_commit_attendu_prefixe_sans_appel_a_github(self):
+        r = self.verifier(agent="emploi", commit=SHA[:7])["agents"][0]
+        self.assertEqual(r["verdict"], "a_jour")
+        self.assertEqual(self.appels, [])
+
+    def test_service_absent_de_l_etat(self):
+        del self.services["agent-devops"]
+        self.assertEqual(self.verdicts(agent="devops"), {"devops": "inconnu"})
+
+    def test_github_injoignable(self):
+        self.github["AnthonyStocko/agent-emploi"] = None
+        r = self.verifier(agent="emploi")["agents"][0]
+        self.assertEqual(r["verdict"], "inconnu")
+        self.assertIn("HTTP 404", r["resume"])
+
+    def test_etat_perime_signale(self):
+        self.genere_le = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)).isoformat()
+        r = self.verifier()
+        self.assertTrue(r["etat_perime"])
+        self.assertIn("peut-être arrêtée", agent_devops.texte(r))
+
+    def test_etat_absent_ou_illisible(self):
+        with self.assertRaises(agent_devops.ErreurDevops) as c:
+            agent_devops.verifier_deploiements()
+        self.assertIn("introuvable", str(c.exception))
+        with open(self.chemin, "w") as f:
+            f.write("pas du json")
+        with self.assertRaises(agent_devops.ErreurDevops) as c:
+            agent_devops.verifier_deploiements()
+        self.assertIn("illisible", str(c.exception))
+        self.assertIn("erreur", deploiements.executer({}))
+
+    def test_agent_inconnu(self):
+        self.ecrire_etat()
+        with self.assertRaises(agent_devops.ErreurDevops):
+            agent_devops.verifier_deploiements(agent="instagram")
+        self.assertIn("agents_possibles", deploiements.executer({"agent": "instagram"}))
+
+    def test_jeton_github_de_lecture(self):
+        self.verifier(agent="emploi")
+        self.assertEqual({j for u, j in self.appels}, {"ghp_dev"})
 
 
 class TestVariables(unittest.TestCase):
-    """Réglage d'une variable Render : seule écriture de l'agent, en deux temps (préparer, puis définir)."""
+    """Réglage d'une variable : une demande déposée dans le dossier partagé, appliquée par le serveur."""
 
     def setUp(self):
-        self.ecritures, self.lectures = [], []
-        self.deploys = []            # ce que Render répond à la lecture des déploiements, après l'écriture
-        self.echec = {}              # méthode -> ErreurApi à lever
+        self.dossier = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dossier.cleanup)
+        env = mock.patch.dict(os.environ, {"DEVOPS_DEMANDES": self.dossier.name}, clear=True)
+        env.start()
+        self.addCleanup(env.stop)
 
-        def faux_ecrire(methode, url, jeton, corps, timeout=30):
-            self.ecritures.append((methode, url, jeton, corps))
-            if methode in self.echec:
-                raise self.echec[methode]
-            return {}
+    def demandes(self):
+        return sorted(os.listdir(self.dossier.name))
 
-        def faux_get(url, jeton, timeout=20):
-            self.lectures.append(url)
-            return self.deploys
+    def test_preparer_ne_depose_rien(self):
+        d = agent_devops.preparer_variable("perso", "JOB_ALERT_SENDERS", " linkedin.com ")
+        self.assertEqual((d["agent"], d["nom"], d["valeur"]), ("perso", "JOB_ALERT_SENDERS", "linkedin.com"))
+        self.assertIn("redémarre", d["resume"])
+        self.assertEqual(self.demandes(), [])
 
-        env = {"RENDER_API_KEY": "cle-secrete", "RENDER_SERVICE_AGENT_PERSO": "srv-perso"}
-        for p in (mock.patch.object(clients, "_ecrire", faux_ecrire), mock.patch.object(clients, "_get", faux_get),
-                  mock.patch.dict(os.environ, env, clear=True)):
-            p.start()
-            self.addCleanup(p.stop)
+    def test_definir_depose_une_demande(self):
+        r = agent_devops.definir_variable("perso", "JOB_ALERT_SENDERS", "linkedin.com, indeed.com")
+        self.assertEqual(r["deploiement"], "en_file")
+        self.assertIn("Demande enregistrée", r["resume"])
+        fichiers = self.demandes()
+        self.assertEqual(fichiers, [r["demande"] + ".json"])   # aucun fichier temporaire restant
+        chemin = os.path.join(self.dossier.name, fichiers[0])
+        with open(chemin, encoding="utf-8") as f:
+            d = json.load(f)
+        self.assertEqual((d["agent"], d["service"], d["nom"], d["valeur"]),
+                         ("perso", "agent-perso", "JOB_ALERT_SENDERS", "linkedin.com, indeed.com"))
+        self.assertEqual(os.stat(chemin).st_mode & 0o777, 0o600)
 
-    def definir(self, nom="JOB_ALERT_SENDERS", valeur="linkedin.com, indeed.com", agent="perso"):
-        return agent_devops.definir_variable(agent, nom, valeur, attente=0)
-
-    def test_preparer_ne_touche_a_rien(self):
-        d = agent_devops.preparer_variable("perso", " JOB_ALERT_SENDERS ", " linkedin.com, indeed.com ")
-        self.assertEqual((d["agent"], d["nom"], d["valeur"]), ("perso", "JOB_ALERT_SENDERS", "linkedin.com, indeed.com"))
-        for mot in ("Agent perso", "JOB_ALERT_SENDERS", "linkedin.com, indeed.com", "redéployé"):
-            self.assertIn(mot, d["resume"])
-        self.assertEqual((self.ecritures, self.lectures), ([], []))
-
-    def test_definir_enregistre_puis_lance_le_deploiement(self):
-        r = self.definir()
-        self.assertEqual([(m, u) for m, u, _, _ in self.ecritures], [
-            ("PUT", "https://api.render.com/v1/services/srv-perso/env-vars/JOB_ALERT_SENDERS"),
-            ("POST", "https://api.render.com/v1/services/srv-perso/deploys")])
-        self.assertEqual(self.ecritures[0][3], {"value": "linkedin.com, indeed.com"})
-        self.assertEqual({j for _, _, j, _ in self.ecritures}, {"cle-secrete"})
-        self.assertEqual(r["deploiement"], "lance")
-        self.assertIn("✅", r["resume"])
-        self.assertNotIn("cle-secrete", str(r))
-        # aucune lecture des variables existantes : seule la liste des déploiements est consultée
-        self.assertTrue(all("/deploys" in u and "env-vars" not in u for u in self.lectures))
-
-    def test_pas_de_second_deploiement_si_render_en_a_lance_un(self):
-        self.deploys = [{"deploy": deploy("build_in_progress")}]
-        r = self.definir()
-        self.assertEqual([m for m, *_ in self.ecritures], ["PUT"])
-        self.assertEqual(r["deploiement"], "en_cours")
-
-    def test_variable_non_enregistree(self):
-        self.echec["PUT"] = clients.ErreurApi("HTTP 401")
-        with self.assertRaises(agent_devops.ErreurDevops) as c:
-            self.definir()
-        self.assertIn("Rien n'a changé", str(c.exception))
-        self.assertEqual([m for m, *_ in self.ecritures], ["PUT"])
-        self.assertNotIn("cle-secrete", str(c.exception))
-
-    def test_deploiement_non_lance_est_signale(self):
-        self.echec["POST"] = clients.ErreurApi("HTTP 500")
-        r = self.definir()
-        self.assertEqual(r["deploiement"], "a_lancer")
-        self.assertIn("⚠️", r["resume"])
-        self.assertIn("enregistrée", r["resume"])
+    def test_deux_demandes_ne_s_ecrasent_pas(self):
+        a = agent_devops.definir_variable("emploi", "MA_VAR", "1")
+        b = agent_devops.definir_variable("emploi", "MA_VAR", "2")
+        self.assertNotEqual(a["demande"], b["demande"])
+        self.assertEqual(len(self.demandes()), 2)
 
     def test_refus(self):
         cas = [
@@ -247,55 +179,35 @@ class TestVariables(unittest.TestCase):
             ("perso", "RENDER_API_KEY", "x", "secret"),
             ("perso", "DATABASE_URL", "x", "secret"),
             ("perso", "RENDER_SERVICE_AGENT_PERSO", "srv-x", "réservée"),
+            ("perso", "RENDER", "true", "réservée"),
             ("perso", "PORT", "80", "réservée"),
+            ("manager", "PERSO_URL", "http://ailleurs", "réservée"),
+            ("emploi", "DATA_DIR", "/tmp", "réservée"),
             ("perso", "job_alert", "x", "invalide"),
             ("perso", "A B", "x", "invalide"),
             ("perso", "JOB_ALERT_SENDERS", "", "valeur"),
             ("perso", "JOB_ALERT_SENDERS", "a\nb", "Valeur refusée"),
             ("perso", "JOB_ALERT_SENDERS", "x" * 2001, "Valeur refusée"),
             ("instagram", "JOB_ALERT_SENDERS", "x", "Agent inconnu"),
-            ("emploi", "JOB_ALERT_SENDERS", "x", "RENDER_SERVICE_AGENT_EMPLOI"),   # service non configuré
+            ("devops", "JOB_ALERT_SENDERS", "x", "Agent inconnu"),
         ]
         for agent, nom, valeur, attendu in cas:
-            for fonction in (agent_devops.preparer_variable, lambda *a: agent_devops.definir_variable(*a, attente=0)):
+            for fonction in (agent_devops.preparer_variable, agent_devops.definir_variable):
                 with self.subTest(nom=nom, valeur=valeur[:10], agent=agent), \
                         self.assertRaises(agent_devops.ErreurDevops) as c:
                     fonction(agent, nom, valeur)
                 self.assertIn(attendu, str(c.exception))
-        self.assertEqual(self.ecritures, [])   # aucun refus n'a écrit quoi que ce soit
+        self.assertEqual(self.demandes(), [])   # aucun refus n'a rien déposé
 
-    def test_sans_cle_render(self):
-        with mock.patch.dict(os.environ, {"RENDER_API_KEY": ""}), self.assertRaises(agent_devops.ErreurDevops) as c:
-            agent_devops.preparer_variable("perso", "JOB_ALERT_SENDERS", "x")
-        self.assertIn("RENDER_API_KEY", str(c.exception))
+    def test_dossier_des_demandes_absent(self):
+        with mock.patch.dict(os.environ, {"DEVOPS_DEMANDES": os.path.join(self.dossier.name, "absent")}):
+            with self.assertRaises(agent_devops.ErreurDevops) as c:
+                agent_devops.preparer_variable("perso", "JOB_ALERT_SENDERS", "x")
+        self.assertIn("pas monté", str(c.exception))
 
     def test_le_serveur_http_ne_sert_pas_cette_ecriture(self):
         from agent_devops.taches import TACHES
         self.assertEqual(sorted(TACHES), ["deploiements", "echecs"])
-
-    def test_client_ecriture_sans_secret_dans_l_erreur(self):
-        self.addCleanup(mock.patch.stopall)
-        mock.patch.stopall()
-        with mock.patch.dict(os.environ, {"RENDER_API_KEY": "cle-secrete"}, clear=True):
-            vu = {}
-
-            class Rep:
-                def __enter__(s): return s
-                def __exit__(s, *a): pass
-                def read(s): return b"{}"
-
-            def faux(req, timeout=0):
-                vu.update(url=req.full_url, methode=req.get_method(), corps=json.loads(req.data),
-                          auth=req.get_header("Authorization"))
-                return Rep()
-            with mock.patch("urllib.request.urlopen", faux):
-                clients.definir_variable_render("srv-1", "MA_VAR", "é à")
-            self.assertEqual((vu["methode"], vu["corps"], vu["auth"]), ("PUT", {"value": "é à"}, "Bearer cle-secrete"))
-            self.assertTrue(vu["url"].endswith("/services/srv-1/env-vars/MA_VAR"))
-            err = urllib.error.HTTPError("https://x/?k=cle-secrete", 403, "no", {}, None)
-            with mock.patch("urllib.request.urlopen", side_effect=err), self.assertRaises(clients.ErreurApi) as c:
-                clients.lancer_deploiement_render("srv-1")
-            self.assertNotIn("cle-secrete", str(c.exception))
 
 
 class TestWorkflows(unittest.TestCase):
@@ -311,8 +223,7 @@ class TestWorkflows(unittest.TestCase):
                 raise self.echec
             return None   # GitHub répond 204 sans corps
 
-        env = {"DEVOPS_ACTIONS_TOKEN": "ghp_actions", "GITHUB_TOKEN": "ghp_lecture", "DEV_GITHUB_TOKEN": "ghp_dev",
-               "RENDER_API_KEY": "cle-secrete"}
+        env = {"DEVOPS_ACTIONS_TOKEN": "ghp_actions", "GITHUB_TOKEN": "ghp_lecture", "DEV_GITHUB_TOKEN": "ghp_dev"}
         for p in (mock.patch.object(clients, "_ecrire", faux_ecrire), mock.patch.dict(os.environ, env, clear=True)):
             p.start()
             self.addCleanup(p.stop)
@@ -506,7 +417,7 @@ class TestEchecsActions(unittest.TestCase):
 
 class TestServeur(unittest.TestCase):
     def setUp(self):
-        env = mock.patch.dict(os.environ, {"HUB_TOKEN": "hub", "RENDER_API_KEY": "cle-secrete"}, clear=True)
+        env = mock.patch.dict(os.environ, {"HUB_TOKEN": "hub", "DEVOPS_ETAT": "/nulle/part.json"}, clear=True)
         env.start()
         self.addCleanup(env.stop)
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), serveur.Gestionnaire)
@@ -543,7 +454,7 @@ class TestServeur(unittest.TestCase):
     def test_deploiements(self):
         code, corps = self.appel("/agent/devops/deploiements?agent=perso", "hub")
         self.assertEqual(code, 200)
-        self.assertEqual(corps["agents"][0]["verdict"], "non_configure")
+        self.assertIn("introuvable", corps["erreur"])   # pas de fichier d'état : erreur lisible, pas de 500
 
 
 if __name__ == "__main__":

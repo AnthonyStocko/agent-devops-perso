@@ -2,31 +2,45 @@
 
 ## Mission
 
-S'occuper de la mise en ligne des agents : dire si ce qui est en ligne sur Render correspond au code,
-régler les variables d'environnement des agents sur Render, et lancer les workflows de déploiement
-autorisés sur GitHub.
+S'occuper de la mise en ligne des agents : dire si ce qui tourne sur le serveur P2 correspond au code,
+faire régler les variables d'environnement des agents, et lancer les workflows de déploiement autorisés
+sur GitHub.
 
-C'est un agent à part entière, avec son dépôt et ses tests. **Pour l'instant il tourne dans le
-processus de l'agent chef**, qui installe ce dépôt comme dépendance (la limite de services Render est
-atteinte). Il sera hébergé à part quand un NAS sera disponible : le serveur HTTP est déjà prêt.
+Depuis le 26 novembre 2026, les agents tournent sur le serveur **P2** (un PC sous Windows avec WSL2 et
+Docker), décrit par le dépôt [serveur-agents](https://github.com/AnthonyStocko/serveur-agents), et non plus
+sur Render. L'agent devops y tourne de deux façons : **en bibliothèque dans l'agent chef**, qui installe ce
+dépôt comme dépendance et s'en sert pour les écritures (après confirmation), et **en serveur autonome**
+(conteneur `agent-devops`, lecture seule).
+
+Il n'a **aucun accès à Docker ni aux secrets du serveur**. Le serveur lui donne deux dossiers :
+
+| Dossier | Accès | Contenu |
+|---|---|---|
+| `/etat` | lecture seule | `deploiements.json`, réécrit toutes les 5 minutes par `mettre-a-jour.sh` |
+| `/demandes` | écriture (agent chef seulement) | les demandes de variables, appliquées par `appliquer-demandes.py` |
 
 ## Ce qu'il fait
 
 ### Vérifier les déploiements (lecture seule)
 
-Pour chaque agent suivi, il interroge Render (`GET /v1/services/{id}/deploys`), lit le dernier commit
-de `main` sur GitHub (ou prend un commit précis) et rend un verdict :
+Pour chaque agent suivi, il lit l'état écrit par le serveur (commit de l'image en service, résultat de la
+dernière mise à jour, état et santé du conteneur), lit le dernier commit de `main` sur GitHub (ou prend un
+commit précis) et rend un verdict :
 
 | Verdict | Sens |
 |---|---|
-| `a_jour` | le commit attendu est en ligne (Live) |
-| `commit_different` | ce qui est en ligne n'est pas le commit attendu |
-| `echec` | le dernier déploiement a échoué (le commit resté en ligne est indiqué) |
-| `en_cours` | un déploiement est en cours |
-| `inconnu` / `erreur` / `non_configure` | pas assez d'informations, Render injoignable, variable manquante |
+| `a_jour` | le commit attendu est en service |
+| `commit_different` | ce qui est en service n'est pas le commit attendu |
+| `echec` | la dernière mise à jour a échoué (le commit resté en service est indiqué) |
+| `en_cours` | une mise à jour est en cours |
+| `hors_service` | le conteneur est arrêté, ou ne répond plus à son contrôle de santé |
+| `inconnu` | pas assez d'informations (agent absent de l'état, GitHub injoignable) |
 
-Agents suivis (`agent_devops/config.py`) : `manager` (agent chef), `emploi`, `perso`. L'agent
-développeur (GitHub Actions) et l'agent Instagram (Supabase) ne sont pas sur Render : ils ne sont pas suivis.
+Si l'état date de plus de 15 minutes, il le signale : la mise à jour automatique du serveur est
+peut-être arrêtée. Sans fichier d'état, il le dit (dossier non monté).
+
+Agents suivis (`agent_devops/config.py`) : `manager` (agent chef), `emploi`, `perso`, `devops`. L'agent
+développeur (GitHub Actions) et l'agent Instagram (Supabase) ne sont pas sur le serveur : ils ne sont pas suivis.
 
 ### Détecter les workflows GitHub Actions en échec (lecture seule)
 
@@ -45,19 +59,22 @@ traitées et les repasse à chaque appel (`deja_signales`) : une exécution déj
 Une relance du même run (nouvelle tentative) en échec compte comme un nouvel échec. Seuls les échecs des
 dernières 24 h sont cherchés (`depuis_heures`, 336 au maximum).
 
-### Régler une variable d'environnement (première écriture)
+### Demander le réglage d'une variable d'environnement (première écriture)
 
-Il crée une variable d'un agent suivi, ou remplace sa valeur
-(`PUT /v1/services/{id}/env-vars/{nom}`), puis s'assure qu'un déploiement l'applique : celui que Render
-lance de lui-même s'il y en a un, sinon il en demande un (`POST /v1/services/{id}/deploys`).
+Il crée une variable d'un agent, ou remplace sa valeur, **par une demande** : un fichier JSON déposé dans
+`/demandes`. Il ne touche lui-même à aucun fichier de secrets ni à Docker. Sur le serveur, le script
+`appliquer-demandes.py` (dépôt serveur-agents), lancé chaque minute, refait toutes les vérifications,
+écrit la variable dans `env/<agent>.env`, redémarre l'agent concerné et range la demande avec son
+résultat.
 
 Cela se fait en deux temps, pour que l'appelant demande une confirmation : `preparer_variable` vérifie
-la demande sans rien modifier, `definir_variable` l'exécute. Sont refusés :
+la demande sans rien déposer, `definir_variable` la dépose. Sont refusés, ici et par le serveur :
 
-- un agent non suivi, ou dont le service Render n'est pas configuré ;
+- un agent autre que `manager`, `emploi` ou `perso` ;
 - un nom qui ressemble à un secret (`PASSWORD`, `TOKEN`, `SECRET`, `KEY`, `OAUTH`, `DATABASE_URL`…) :
-  les secrets se règlent à la main dans Render ;
-- une variable réservée (`PORT`, `RENDER_...`) ;
+  les secrets se règlent à la main dans `env/` sur le serveur ;
+- une variable réservée : celles du système, celles que `docker-compose.yml` règle lui-même (`PORT`,
+  `HOST`, `DATA_DIR`, `HUB_URL`, `EMPLOI_URL`, `PERSO_URL`, `TZ`…) et `RENDER`, `RENDER_...` ;
 - une valeur vide, sur plusieurs lignes ou de plus de 2 000 caractères.
 
 ### Déclencher un workflow en liste blanche (seconde écriture)
@@ -86,14 +103,13 @@ une modification de code.
 
 ## Ce qu'il ne fait jamais
 
-- **Écrire autre chose que ses deux écritures.** Sur Render : aucune suppression de variable, aucun
-  redémarrage ni suppression de service, aucun changement de configuration ; il ne lance un déploiement
-  que pour appliquer la variable qu'il vient d'enregistrer. Sur GitHub : aucun commit, aucune pull
+- **Écrire autre chose que ses deux écritures.** Sur le serveur : rien d'autre qu'un fichier de demande
+  dans `/demandes` ; aucun accès à Docker, aucun arrêt, aucune mise à jour, aucune suppression. Sur GitHub : aucun commit, aucune pull
   request, aucun workflow hors de la liste blanche, aucune annulation ni relance de run, aucune
   modification de workflow, de secret ou de variable.
 - **Écrire sans confirmation.** Ses deux écritures ne sont pas servies par le serveur HTTP, qui refuse
   tout sauf GET : elles passent par l'agent chef, qui montre ce qui sera fait et attend un « oui ».
-- **Lire ou montrer un secret.** Les valeurs des variables en place ne sont jamais lues. Ni la clé Render
+- **Lire ou montrer un secret.** Les valeurs des variables en place ne sont jamais lues. Ni un mot de passe
   ni un jeton n'apparaît dans une réponse, une erreur ou un journal.
 - **Sortir de son domaine.** Il ne modifie pas le code (rôle d'agent-dev) et ne parle pas à l'utilisateur
   (rôle de l'agent chef).
@@ -107,7 +123,7 @@ sa discussion (« est-ce que le correctif de l'agent emploi est en ligne ? », �
 JOB_ALERT_SENDERS à l'agent perso avec linkedin.com », « déploie les fonctions Supabase de l'agent
 Instagram ») et par le bouton **Vérifier les déploiements** de son onglet Développeur.
 
-### Aujourd'hui : en bibliothèque, dans l'agent chef
+### En bibliothèque, dans l'agent chef
 
 ```python
 import agent_devops
@@ -130,8 +146,8 @@ for e in echecs["echecs"]:                                      # dépôt, workf
     print(e["depot"], e["workflow"], e["cause"], e["resume"])
 ```
 
-`ErreurDevops` est levée quand une demande est refusée ou impossible (clé Render ou jeton absents, agent ou
-workflow inconnus, nom, valeur ou entrée refusés, écriture refusée par Render ou GitHub). Ces sept noms
+`ErreurDevops` est levée quand une demande est refusée ou impossible (état ou dossier des demandes absents, jeton absent, agent ou
+workflow inconnus, nom, valeur ou entrée refusés, écriture refusée par GitHub). Ces sept noms
 (plus `detecter_echecs_actions` et `texte_echecs_actions`, en lecture seule) sont l'interface utilisée par l'agent chef : ne pas les renommer sans le modifier aussi.
 
 L'agent chef fixe la version qu'il installe par un commit, dans son `requirements.txt` :
@@ -141,20 +157,20 @@ L'agent chef fixe la version qu'il installe par un commit, dans son `requirement
 **Une modification de ce dépôt n'arrive donc dans l'agent chef que lorsque ce commit y est mis à
 jour.** Le dépôt doit rester public pour que cette installation fonctionne sans jeton.
 
-### Plus tard : en serveur autonome
+### En serveur autonome (conteneur `agent-devops` du serveur P2)
 
     python app.py            # port lu dans PORT, sinon 8796 ; aucune dépendance à installer
 
 ```
 GET /healthz                                   public, sert au contrôle de démarrage
 GET /agent/devops/deploiements                 tous les agents
-GET /agent/devops/deploiements?agent=emploi    un seul (manager, emploi, perso)
+GET /agent/devops/deploiements?agent=emploi    un seul (manager, emploi, perso, devops)
 GET /agent/devops/deploiements?commit=<sha>    vérifie ce commit (SHA complet ou début)
 GET /agent/devops/echecs                       nouveaux workflows GitHub Actions en échec
 GET /agent/devops/echecs?deja_signales=<cle>,<cle>&depuis_heures=24&depot=<proprietaire/depot>
 ```
 
-En conteneur (Coolify sur la VM Oracle, ou plus tard un serveur à la maison) : le `Dockerfile` construit
+En conteneur (service `agent-devops` du serveur P2) : le `Dockerfile` construit
 une image arm64 ou amd64, sans dépendance, qui lance `python app.py` et se contrôle sur `/healthz`. Le
 workflow `Image Docker` vérifie à chaque push que l'image se construit pour les deux architectures et
 démarre. Variables à fournir au conteneur : celles du tableau ci-dessous, dont `HUB_TOKEN`.
@@ -165,14 +181,11 @@ seule : ni le réglage des variables ni le déclenchement des workflows n'y sont
 
 ## Variables d'environnement
 
-Elles sont lues dans le processus où l'agent tourne : aujourd'hui, le service Render de l'agent chef.
-
 | Variable | Rôle |
 |---|---|
-| `RENDER_API_KEY` | clé API Render (Account Settings > API Keys) ; elle donne accès à tout le compte, en lecture et en écriture |
-| `RENDER_SERVICE_AGENT_EMPLOI`, `RENDER_SERVICE_AGENT_PERSO` | identifiants `srv-...` des services Render ; un agent sans variable est signalé `non_configure` |
-| `RENDER_SERVICE_AGENT_MANAGER` | identifiant du service de l'agent chef ; inutile tant que l'agent tourne dans l'agent chef (Render fournit `RENDER_SERVICE_ID`) |
-| `GITHUB_TOKEN` | facultatif, lecture seule (déploiements et échecs GitHub Actions) : dépôt privé ou limite de l'API GitHub ; à défaut, `DEV_GITHUB_TOKEN` est utilisé |
+| `DEVOPS_ETAT` | chemin du fichier d'état écrit par le serveur ; par défaut `/etat/deploiements.json` |
+| `DEVOPS_DEMANDES` | dossier des demandes de variables ; par défaut `/demandes` (monté seulement dans l'agent chef) |
+| `GITHUB_TOKEN` | facultatif, lecture seule (dernier commit, échecs GitHub Actions) : dépôt privé ou limite de l'API GitHub ; à défaut, `DEV_GITHUB_TOKEN` est utilisé |
 | `DEVOPS_ACTIONS_TOKEN` | déclenchement des workflows uniquement : jeton GitHub à granularité fine, limité au dépôt `mon-guide-agent-instagram`, avec la seule permission « Actions » en lecture et écriture ; jamais remplacé par `GITHUB_TOKEN` ni `DEV_GITHUB_TOKEN` |
 | `HUB_TOKEN` | serveur autonome seulement : jeton que l'appelant présente ; sans lui, tout appel est refusé |
 
@@ -184,8 +197,8 @@ l'enregistrer dans `agent_devops/taches/__init__.py` (`TACHES`) : elle est servi
 `agent_devops/__init__.py`.
 
 Une tâche qui écrit ne s'ajoute pas ainsi : c'est un changement de cadrage, qui se décide d'abord dans ce
-README et dans `CLAUDE.md`. Les deux seules écritures autorisées aujourd'hui sont le réglage d'une
-variable Render et le déclenchement d'un workflow de la liste blanche.
+README et dans `CLAUDE.md`. Les deux seules écritures autorisées aujourd'hui sont la demande de réglage d'une
+variable et le déclenchement d'un workflow de la liste blanche.
 
 ## Tests
 
@@ -194,10 +207,10 @@ variable Render et le déclenchement d'un workflow de la liste blanche.
 ## Fichiers
 
 - `agent_devops/__init__.py` : interface appelée par l'agent chef
-- `agent_devops/config.py` : agents suivis et variables — `agent_devops/clients.py` : appels Render et GitHub
+- `agent_devops/config.py` : agents suivis et variables — `agent_devops/clients.py` : appels GitHub
 - `agent_devops/taches/deploiements.py` : vérification des déploiements
 - `agent_devops/taches/echecs.py` : détection des workflows GitHub Actions en échec
-- `agent_devops/taches/variables.py` : réglage d'une variable d'environnement
+- `agent_devops/taches/variables.py` : demande de réglage d'une variable d'environnement
 - `agent_devops/taches/workflows.py` : lancement d'un workflow de la liste blanche
 - `agent_devops/serveur.py` : serveur HTTP autonome — `app.py` : son lancement
 - `pyproject.toml` : rend le dépôt installable — `test_devops.py` : tests

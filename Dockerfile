@@ -1,5 +1,5 @@
 # Agent devops en serveur autonome (lecture seule, GET) : python app.py, port lu dans PORT (8796 par défaut).
-# Image multi-architecture (arm64 pour la VM Oracle, amd64 pour un PC) : bibliothèque standard seulement.
+# Image multi-architecture (amd64 pour le serveur P2, arm64 au besoin) : bibliothèque standard seulement.
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

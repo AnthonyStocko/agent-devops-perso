@@ -3,12 +3,18 @@
 Lire `README.md` avant toute modification : il fixe la mission de l'agent et ses limites.
 
 Règles non négociables :
-- Deux écritures autorisées, et aucune autre. Partout ailleurs, lecture seule (GET) sur Render et sur
-  GitHub. Ne pas ajouter d'autre tâche qui écrit : ce serait un changement de cadrage, qui se décide
+- Les agents tournent sur le serveur P2 (dépôt `AnthonyStocko/serveur-agents`, Docker Compose), et non plus sur
+  Render (décidé le 26 novembre 2026). L'agent devops n'a aucun accès à Docker ni aux secrets du serveur :
+  il lit l'état des déploiements dans un fichier écrit par le serveur (`/etat`, monté en lecture seule) et
+  ne communique ses demandes que par le dossier partagé `/demandes`.
+- Deux écritures autorisées, et aucune autre. Partout ailleurs, lecture seule (GET sur GitHub, lecture du
+  fichier d'état). Ne pas ajouter d'autre tâche qui écrit : ce serait un changement de cadrage, qui se décide
   dans ce fichier.
-  1. **Render : régler une variable d'environnement** (`agent_devops/taches/variables.py`). Elle
-     enregistre une variable d'un agent suivi, puis lance le déploiement qui l'applique. Ni suppression
-     de variable, ni redémarrage, ni suppression ou reconfiguration d'un service.
+  1. **Serveur P2 : demander le réglage d'une variable d'environnement** (`agent_devops/taches/variables.py`).
+     Elle dépose une demande (un fichier JSON) dans `/demandes`, et rien d'autre ; le script
+     `appliquer-demandes.py` de serveur-agents la vérifie de nouveau avec les mêmes garde-fous, l'écrit
+     dans `env/<agent>.env` et redémarre cet agent. Ni suppression de variable, ni secret, ni variable
+     réglée par `docker-compose.yml`, ni autre action sur le serveur (arrêt, mise à jour, suppression).
   2. **GitHub : déclencher un workflow en liste blanche** (`workflow_dispatch`). Seulement les workflows
      et les valeurs d'entrée de la liste ci-dessous, sur la branche `main`. Ni commit, ni pull request,
      ni annulation ou relance d'un run, ni modification d'un workflow, d'un secret ou d'une variable
@@ -27,13 +33,14 @@ Règles non négociables :
   `preparer_...` vérifie la demande sans rien modifier ni appeler, puis `definir_variable` ou
   `declencher_workflow` l'exécute. Elles ne sont jamais servies par le serveur HTTP, qui reste en GET
   seul. Un déclenchement confirmé lance un seul run, sans relance automatique. Pour les variables, les
-  noms de secrets et les variables réservées sont refusés et les valeurs en place ne sont jamais lues.
+  noms de secrets et les variables réservées sont refusés et les valeurs en place ne sont jamais lues ; le
+  serveur applique ces mêmes refus de son côté.
   Ne pas affaiblir ces garde-fous.
 - Jetons. Le déclenchement d'un workflow utilise uniquement `DEVOPS_ACTIONS_TOKEN`, un jeton à
   granularité fine limité au dépôt `mon-guide-agent-instagram`, avec la seule permission « Actions » en
   lecture et écriture. Sans lui, le déclenchement est refusé : jamais de repli sur `GITHUB_TOKEN` ni sur
   `DEV_GITHUB_TOKEN`, qui ne servent qu'à lire.
-- Aucun secret (clé Render, jeton) dans le dépôt, dans une réponse, dans un message d'erreur ni dans
+- Aucun secret (jeton, mot de passe) dans le dépôt, dans une réponse, dans un message d'erreur ni dans
   un journal.
 - Bibliothèque standard uniquement : aucune dépendance à installer.
 - L'agent chef importe `agent_devops.verifier_deploiements`, `agent_devops.texte`,

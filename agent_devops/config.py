@@ -1,19 +1,18 @@
 """Configuration de l'agent devops : tout vient des variables d'environnement, rien n'est écrit en dur."""
 import os
 
-# Agents suivis : seulement ceux qui sont hébergés sur Render. L'agent développeur (GitHub Actions) et
-# l'agent Instagram (Supabase) n'y sont pas. Clé -> dépôt GitHub et variables d'environnement qui portent
-# l'identifiant du service Render (la première définie est retenue).
-# RENDER_SERVICE_ID est fournie par Render au service en cours : tant que cet agent tourne dans l'agent
-# chef, le service de l'agent chef est donc reconnu sans réglage.
+# Agents suivis : ceux qui tournent sur le serveur P2 (dépôt serveur-agents, Docker Compose). L'agent
+# développeur (GitHub Actions) et l'agent Instagram (Supabase) n'y sont pas.
+# Clé -> nom, dépôt GitHub et service Docker Compose.
 AGENTS = {
-    "manager": {"nom": "Agent chef", "depot": "AnthonyStocko/agent-manager",
-                "service_env": ("RENDER_SERVICE_AGENT_MANAGER", "RENDER_SERVICE_ID")},
-    "emploi": {"nom": "Agent emploi", "depot": "AnthonyStocko/agent-emploi",
-               "service_env": ("RENDER_SERVICE_AGENT_EMPLOI",)},
-    "perso": {"nom": "Agent perso", "depot": "AnthonyStocko/agent-perso",
-              "service_env": ("RENDER_SERVICE_AGENT_PERSO",)},
+    "manager": {"nom": "Agent chef", "depot": "AnthonyStocko/agent-manager", "service": "agent-manager"},
+    "emploi": {"nom": "Agent emploi", "depot": "AnthonyStocko/agent-emploi", "service": "agent-emploi"},
+    "perso": {"nom": "Agent perso", "depot": "AnthonyStocko/agent-perso", "service": "agent-perso"},
+    "devops": {"nom": "Agent devops", "depot": "AnthonyStocko/agent-devops-perso", "service": "agent-devops"},
 }
+
+# Agents dont l'agent devops peut régler une variable (par une demande appliquée par le serveur)
+AGENTS_VARIABLES = ("manager", "emploi", "perso")
 
 
 # Workflows GitHub que l'agent peut lancer (workflow_dispatch, branche main). Copie de la liste blanche de
@@ -36,8 +35,14 @@ WORKFLOWS = {
 BRANCHE_WORKFLOWS = "main"
 
 
-def cle_render():
-    return (os.getenv("RENDER_API_KEY") or "").strip()
+def fichier_etat():
+    """État des déploiements écrit par le serveur (mettre-a-jour.sh), monté en lecture seule."""
+    return (os.getenv("DEVOPS_ETAT") or "/etat/deploiements.json").strip()
+
+
+def dossier_demandes():
+    """Dossier où sont déposées les demandes de variables, appliquées par le serveur (appliquer-demandes.py)."""
+    return (os.getenv("DEVOPS_DEMANDES") or "/demandes").strip()
 
 
 def jeton_github():
@@ -55,12 +60,3 @@ def jeton_actions():
 def jeton_acces():
     """Jeton exigé par le serveur HTTP de cet agent (même valeur que HUB_TOKEN côté agent chef)."""
     return os.getenv("HUB_TOKEN") or ""
-
-
-def service_id(cle):
-    """Identifiant srv-... du service Render de l'agent, ou chaîne vide s'il n'est pas configuré."""
-    for nom in AGENTS[cle]["service_env"]:
-        valeur = (os.getenv(nom) or "").strip()
-        if valeur:
-            return valeur
-    return ""
