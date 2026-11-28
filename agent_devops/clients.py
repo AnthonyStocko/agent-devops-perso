@@ -14,7 +14,11 @@ GITHUB_API = "https://api.github.com"
 
 
 class ErreurApi(Exception):
-    """Erreur d'un service externe, avec un message sans secret."""
+    """Erreur d'un service externe, avec un message sans secret. `code` : code HTTP, quand il y en a un."""
+
+    def __init__(self, message="", code=None):
+        super().__init__(message)
+        self.code = code
 
 
 def _get(url, jeton, timeout=20):
@@ -25,7 +29,7 @@ def _get(url, jeton, timeout=20):
         with urllib.request.urlopen(urllib.request.Request(url, headers=entetes), timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8") or "null")
     except urllib.error.HTTPError as e:
-        raise ErreurApi(f"HTTP {e.code}") from None
+        raise ErreurApi(f"HTTP {e.code}", e.code) from None
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
         raise ErreurApi("service injoignable ou réponse illisible") from None
 
@@ -49,7 +53,7 @@ def _ecrire(methode, url, jeton, corps, timeout=30):
         with urllib.request.urlopen(requete, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8") or "null")
     except urllib.error.HTTPError as e:
-        raise ErreurApi(f"HTTP {e.code}") from None
+        raise ErreurApi(f"HTTP {e.code}", e.code) from None
     except (urllib.error.URLError, TimeoutError, OSError, ValueError):
         raise ErreurApi("service injoignable ou réponse illisible") from None
 
@@ -94,3 +98,44 @@ def annotations_du_job(depot, job_id):
     """Annotations d'un job : message d'erreur explicite s'il y en a (GET /repos/{depot}/check-runs/{id}/annotations)."""
     chemin = f"/repos/{depot}/check-runs/{int(job_id)}/annotations?per_page=10"
     return [a for a in (_get_github(chemin) or []) if isinstance(a, dict)]
+
+
+MAX_JOURNAL = 5_000_000  # octets : au-delà, le journal d'un job est jugé trop volumineux et n'est pas lu
+
+
+class _RedirectionSansJeton(urllib.request.HTTPRedirectHandler):
+    """Suit la redirection vers le stockage des journaux sans lui transmettre le jeton GitHub (https seulement)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not newurl.lower().startswith("https://"):
+            return None
+        nouvelle = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if nouvelle is not None:
+            for h in ("Authorization", "authorization"):
+                nouvelle.headers.pop(h, None)
+                nouvelle.unredirected_hdrs.pop(h, None)
+        return nouvelle
+
+
+def _get_texte(url, jeton, timeout=30, maxi=MAX_JOURNAL):
+    """GET d'un texte brut (lecture seule), avec redirection sans jeton. Donnée non fiable : jamais interprétée."""
+    entetes = {"Accept": "application/vnd.github+json", "User-Agent": "agent-devops/1.0"}
+    if jeton:
+        entetes["Authorization"] = "Bearer " + jeton
+    ouvreur = urllib.request.build_opener(_RedirectionSansJeton)
+    try:
+        with ouvreur.open(urllib.request.Request(url, headers=entetes), timeout=timeout) as resp:
+            brut = resp.read(maxi + 1)
+    except urllib.error.HTTPError as e:
+        raise ErreurApi(f"HTTP {e.code}", e.code) from None
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        raise ErreurApi("service injoignable ou réponse illisible") from None
+    if len(brut) > maxi:
+        raise ErreurApi("journal trop volumineux")
+    return brut.decode("utf-8", errors="replace")
+
+
+def journal_du_job(depot, job_id):
+    """Journal brut d'un job (GET /repos/{depot}/actions/jobs/{id}/logs, redirigé vers un fichier temporaire).
+    Demande la permission « Actions » en lecture. Lecture seule ; le texte est une donnée non fiable."""
+    return _get_texte(f"{GITHUB_API}/repos/{depot}/actions/jobs/{int(job_id)}/logs", config.jeton_github())
