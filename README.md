@@ -48,8 +48,23 @@ Il consulte les exécutions de GitHub Actions (`GET /repos/{dépôt}/actions/run
 `main`) de chaque dépôt de son périmètre : les agents suivis (`manager`, `emploi`, `perso`) et le dépôt de
 l'agent Instagram. Pour chaque exécution en échec, il lit les jobs (et l'annotation d'erreur du job, quand le
 workflow en produit une) et rend : le **dépôt**, le **workflow**, la **cause** (job et étape en échec), un
-**résumé** de l'erreur, le lien du run et une **clé** stable `dépôt#run#tentative`. Les journaux bruts ne
-sont pas lus.
+**résumé** de l'erreur, le lien du run et une **clé** stable `dépôt#run#tentative`.
+
+Il lit aussi le **journal du job en échec** (`GET /repos/{dépôt}/actions/jobs/{id}/logs`, l'équivalent de
+`gh run view --log-failed`) et ajoute à chaque échec un **extrait** (`extrait`) : les 40 dernières lignes
+jusqu'à l'erreur signalée, pas le journal complet. Le résumé s'appuie sur l'erreur du journal quand elle est
+plus précise que l'annotation (« Process completed with exit code 1 »). Seul le premier job en échec est lu.
+Le champ `journal` vaut `lu`, ou `indisponible : <raison>` (journal expiré, droits insuffisants, trop
+volumineux — plus de 5 Mo —, GitHub injoignable) : dans ce cas l'agent retombe sur les annotations et le dit.
+Avant d'être remonté, l'extrait est **masqué** (`***`) : jetons, mots de passe, URL avec identifiants ou de
+base de données, valeurs de `DATABASE_URL`, `SAUVEGARDE_PHRASE`, `AGENT_URL`, `CRON_SECRET`, etc. Le journal
+est une donnée non fiable : il n'est jamais exécuté et les instructions qu'il contient ne sont pas suivies. Le
+jeton n'est pas transmis à l'adresse de téléchargement vers laquelle GitHub redirige.
+
+**Jeton nécessaire.** Le téléchargement des journaux exige un jeton (même pour un dépôt public) avec la
+permission **Actions : lecture** (`actions:read`) sur les dépôts surveillés. Pour un jeton à granularité fine,
+cocher « Actions » en lecture seule pour ces dépôts ; pour un jeton classique, la portée `repo`. Sans cela,
+le rapport indique « droits insuffisants » et les annotations sont utilisées.
 
 Il ne corrige rien, ne relance rien et n'écrit rien : c'est l'agent chef qui décide si un correctif est
 nécessaire, puis le demande à l'agent développeur.
@@ -185,7 +200,7 @@ seule : ni le réglage des variables ni le déclenchement des workflows n'y sont
 |---|---|
 | `DEVOPS_ETAT` | chemin du fichier d'état écrit par le serveur ; par défaut `/etat/deploiements.json` |
 | `DEVOPS_DEMANDES` | dossier des demandes de variables ; par défaut `/demandes` (monté seulement dans l'agent chef) |
-| `GITHUB_TOKEN` | facultatif, lecture seule (dernier commit, échecs GitHub Actions) : dépôt privé ou limite de l'API GitHub ; à défaut, `DEV_GITHUB_TOKEN` est utilisé |
+| `GITHUB_TOKEN` | lecture seule (dernier commit, échecs et journaux GitHub Actions) : pour lire les journaux, permission « Actions » en lecture requise ; facultatif sinon (dépôt privé, limite de l'API) ; à défaut, `DEV_GITHUB_TOKEN` est utilisé |
 | `DEVOPS_ACTIONS_TOKEN` | déclenchement des workflows uniquement : jeton GitHub à granularité fine, limité au dépôt `mon-guide-agent-instagram`, avec la seule permission « Actions » en lecture et écriture ; jamais remplacé par `GITHUB_TOKEN` ni `DEV_GITHUB_TOKEN` |
 | `HUB_TOKEN` | serveur autonome seulement : jeton que l'appelant présente ; sans lui, tout appel est refusé |
 
@@ -209,7 +224,7 @@ variable et le déclenchement d'un workflow de la liste blanche.
 - `agent_devops/__init__.py` : interface appelée par l'agent chef
 - `agent_devops/config.py` : agents suivis et variables — `agent_devops/clients.py` : appels GitHub
 - `agent_devops/taches/deploiements.py` : vérification des déploiements
-- `agent_devops/taches/echecs.py` : détection des workflows GitHub Actions en échec
+- `agent_devops/taches/echecs.py` : détection des workflows GitHub Actions en échec — `agent_devops/journaux.py` : masquage des secrets et extrait des journaux
 - `agent_devops/taches/variables.py` : demande de réglage d'une variable d'environnement
 - `agent_devops/taches/workflows.py` : lancement d'un workflow de la liste blanche
 - `agent_devops/serveur.py` : serveur HTTP autonome — `app.py` : son lancement
